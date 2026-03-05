@@ -1,0 +1,58 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "API: Nest Dev (ts-node)",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--workspace",
+        "@zenith/api",
+        "run",
+        "dev"
+      ],
+      "console": "integratedTerminal",
+      "skipFiles": [
+        "<node_internals>/**"
+      ],
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Web: Vite Dev",
+      "type": "node",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--workspace",
+        "@zenith/web",
+        "run",
+        "dev"
+      ],
+      "console": "integratedTerminal",
+      "skipFiles": [
+        "<node_internals>/**"
+      ],
+      "envFile": "${workspaceFolder}/.env"
+    },
+    {
+      "name": "Web: Chrome Attach (5173)",
+      "type": "pwa-chrome",
+      "request": "launch",
+      "url": "http://localhost:5173",
+      "webRoot": "${workspaceFolder}/apps/web/src"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Full Stack: API + Web + Chrome",
+      "configurations": [
+        "API: Nest Dev (ts-node)",
+        "Web: Vite Dev",
+        "Web: Chrome Attach (5173)"
+      ]
+    }
+  ]
+}

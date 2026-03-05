@@ -1,0 +1,15 @@
+{
+  "name": "zenith-v4",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc -b",
+    "typecheck:web": "tsc -p apps/web/tsconfig.json",
+    "typecheck:api": "tsc -p apps/api/tsconfig.json",
+    "typecheck:contracts": "tsc -p packages/contracts/tsconfig.json"
+  }
+}
