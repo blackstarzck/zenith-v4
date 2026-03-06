@@ -55,10 +55,50 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
       return;
     }
 
-    this.runsService.ingestEvent(event);
+    const mismatches = this.runsService.validateEventAgainstRunConfig(event);
+    if (mismatches.length > 0) {
+      this.metrics.markRunConfigMismatch();
+      this.logger.warn('Event payload mismatches runConfig snapshot', {
+        source: 'modules.ws.realtime.ingestEngineEvent',
+        eventType: SYSTEM_EVENT_TYPE.ENGINE_STATE_INVALID,
+        runId: event.runId,
+        traceId: event.traceId,
+        payload: { seq: event.seq, eventType: event.eventType, mismatches }
+      });
+      if (process.env.RUNCONFIG_MISMATCH_BLOCK === 'true') {
+        const pauseEvent: WsEventEnvelopeDto = {
+          runId: event.runId,
+          seq: event.seq,
+          traceId: event.traceId,
+          eventType: 'PAUSE',
+          eventTs: event.eventTs,
+          payload: {
+            reason: 'RUNCONFIG_MISMATCH_BLOCKED',
+            blockedEventType: event.eventType,
+            mismatches
+          }
+        };
 
+        await this.persistAndPublish(pauseEvent);
+        this.logger.error('Blocked event by RUNCONFIG_MISMATCH_BLOCK guard', {
+          source: 'modules.ws.realtime.ingestEngineEvent',
+          eventType: SYSTEM_EVENT_TYPE.ENGINE_STATE_INVALID,
+          runId: event.runId,
+          traceId: event.traceId,
+          payload: { seq: event.seq, eventType: event.eventType }
+        });
+        return;
+      }
+    }
+
+    await this.persistAndPublish(event);
+  }
+
+  private async persistAndPublish(event: WsEventEnvelopeDto): Promise<void> {
+    this.runsService.ingestEvent(event);
     const persisted = await this.db.safeInsertRunEvent(event);
     if (!persisted.ok) {
+      this.metrics.markDbWriteFailure();
       this.logger.warn('Event persistence skipped; runtime loop continues', {
         source: 'modules.ws.realtime.ingestEngineEvent',
         eventType: SYSTEM_EVENT_TYPE.DB_WRITE_FAILED,
@@ -76,6 +116,7 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     try {
       this.server?.emit('run-event', event);
     } catch (error: unknown) {
+      this.metrics.markWsPushFailure();
       this.logger.warn('WS serialization or send failed', {
         source: 'modules.ws.realtime.pushToSubscribers',
         eventType: SYSTEM_EVENT_TYPE.WS_SERIALIZE_FAILED,

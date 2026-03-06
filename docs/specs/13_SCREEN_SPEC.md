@@ -262,6 +262,10 @@ stateDiagram-v2
 - createdAt
 - actions: Open(run), Report, Export
 
+현재 구현 반영:
+- `GET /runs/history`는 `strategyId`, `strategyVersion`, `mode`, `market`, `from`, `to` 쿼리 필터를 지원한다.
+- 리포트 KPI에는 `PF(profitFactor)`, `avgWinPct`, `avgLossPct`를 포함한다.
+
 ---
 
 ## 4.3 `/runs/:runId` — 실행 상세(운영 관점)

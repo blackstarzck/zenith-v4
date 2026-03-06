@@ -5,6 +5,7 @@ import { WsModule } from '../ws/ws.module';
 
 @Module({
   imports: [WsModule],
-  providers: [UpbitRealtimeEngine, UpbitMarketClient]
+  providers: [UpbitRealtimeEngine, UpbitMarketClient],
+  exports: [UpbitRealtimeEngine]
 })
 export class ExecutionModule {}

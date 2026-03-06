@@ -8,6 +8,7 @@ const { Title } = Typography;
 type RunHistoryRow = Readonly<{
   runId: string;
   strategyId: 'STRAT_A' | 'STRAT_B' | 'STRAT_C';
+  strategyVersion: string;
   mode: 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
   fillModelApplied: 'NEXT_OPEN' | 'ON_CLOSE';
   entryPolicy: string;
@@ -17,6 +18,9 @@ type RunHistoryRow = Readonly<{
   winRate: number;
   sumReturnPct: number;
   mddPct: number;
+  profitFactor: number;
+  avgWinPct: number;
+  avgLossPct: number;
   lastEventAt?: string;
 }>;
 
@@ -31,7 +35,7 @@ export function ReportsRunsPage() {
     <div style={{ padding: 16 }}>
       <Title level={3} style={{ marginTop: 0 }}>런 리포트</Title>
       <Card>
-        누적 수익률(sumReturn), 승률(winRate), MDD(최대 낙폭)로 전략 실행 성능을 확인합니다.
+        누적 수익률, 승률, MDD, PF(손익비), 평균 이익/손실로 전략 실행 성능을 확인합니다.
         <Table
           size="small"
           pagination={false}
@@ -44,6 +48,7 @@ export function ReportsRunsPage() {
               render: (value: string) => <Link to={`/reports/runs/${value}`}>{value}</Link>
             },
             { title: '전략 ID', dataIndex: 'strategyId', key: 'strategyId' },
+            { title: '전략 버전', dataIndex: 'strategyVersion', key: 'strategyVersion' },
             {
               title: '승률(winRate)',
               dataIndex: 'winRate',
@@ -60,6 +65,24 @@ export function ReportsRunsPage() {
               title: '최대 낙폭(MDD)',
               dataIndex: 'mddPct',
               key: 'mddPct',
+              render: (value: number) => `${value.toFixed(4)}%`
+            },
+            {
+              title: 'PF',
+              dataIndex: 'profitFactor',
+              key: 'profitFactor',
+              render: (value: number) => (value >= 9999 ? '무한대' : value.toFixed(4))
+            },
+            {
+              title: '평균 이익',
+              dataIndex: 'avgWinPct',
+              key: 'avgWinPct',
+              render: (value: number) => `${value.toFixed(4)}%`
+            },
+            {
+              title: '평균 손실',
+              dataIndex: 'avgLossPct',
+              key: 'avgLossPct',
               render: (value: number) => `${value.toFixed(4)}%`
             }
           ]}

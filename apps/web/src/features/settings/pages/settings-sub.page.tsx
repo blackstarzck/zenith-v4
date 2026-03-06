@@ -8,11 +8,19 @@ const { Title } = Typography;
 type OpsMetrics = Readonly<{
   wsConnections: number;
   wsDisconnections: number;
+  wsActiveClients: number;
   eventsIngested: number;
   marketTicks: number;
   signals: number;
   fills: number;
   exits: number;
+  dbWriteFailures: number;
+  wsPushFailures: number;
+  runConfigMismatches: number;
+  upbitReconnectAttempts: number;
+  upbitReconnectRecoveries: number;
+  upbitAvgRecoveryMs: number;
+  lastDisconnectAt?: string;
   lastEventAt?: string;
 }>;
 
@@ -43,11 +51,19 @@ export function SettingsSubPage() {
           <Descriptions.Item label="메모(note)">실서비스 안전 기본값(production-safe defaults) 적용</Descriptions.Item>
           {section === 'system' ? <Descriptions.Item label="WS 연결 수">{metrics?.wsConnections ?? 0}</Descriptions.Item> : null}
           {section === 'system' ? <Descriptions.Item label="WS 해제 수">{metrics?.wsDisconnections ?? 0}</Descriptions.Item> : null}
+          {section === 'system' ? <Descriptions.Item label="현재 WS 클라이언트">{metrics?.wsActiveClients ?? 0}</Descriptions.Item> : null}
           {section === 'system' ? <Descriptions.Item label="이벤트 수신">{metrics?.eventsIngested ?? 0}</Descriptions.Item> : null}
           {section === 'system' ? <Descriptions.Item label="마켓 틱 수">{metrics?.marketTicks ?? 0}</Descriptions.Item> : null}
           {section === 'system' ? <Descriptions.Item label="시그널 수">{metrics?.signals ?? 0}</Descriptions.Item> : null}
           {section === 'system' ? <Descriptions.Item label="체결 수">{metrics?.fills ?? 0}</Descriptions.Item> : null}
           {section === 'system' ? <Descriptions.Item label="청산 수">{metrics?.exits ?? 0}</Descriptions.Item> : null}
+          {section === 'system' ? <Descriptions.Item label="DB 저장 실패">{metrics?.dbWriteFailures ?? 0}</Descriptions.Item> : null}
+          {section === 'system' ? <Descriptions.Item label="WS 푸시 실패">{metrics?.wsPushFailures ?? 0}</Descriptions.Item> : null}
+          {section === 'system' ? <Descriptions.Item label="runConfig 불일치">{metrics?.runConfigMismatches ?? 0}</Descriptions.Item> : null}
+          {section === 'system' ? <Descriptions.Item label="업비트 재연결 시도">{metrics?.upbitReconnectAttempts ?? 0}</Descriptions.Item> : null}
+          {section === 'system' ? <Descriptions.Item label="업비트 복구 성공">{metrics?.upbitReconnectRecoveries ?? 0}</Descriptions.Item> : null}
+          {section === 'system' ? <Descriptions.Item label="평균 복구 시간(ms)">{metrics?.upbitAvgRecoveryMs ?? 0}</Descriptions.Item> : null}
+          {section === 'system' ? <Descriptions.Item label="마지막 연결 해제 시각">{metrics?.lastDisconnectAt ?? '-'}</Descriptions.Item> : null}
           {section === 'system' ? <Descriptions.Item label="마지막 이벤트 시각">{metrics?.lastEventAt ?? '-'}</Descriptions.Item> : null}
         </Descriptions>
       </Card>

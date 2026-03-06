@@ -8,6 +8,7 @@ const { Title } = Typography;
 type RunDetailResponse = Readonly<{
   runId: string;
   strategyId: 'STRAT_A' | 'STRAT_B' | 'STRAT_C';
+  strategyVersion: string;
   mode: 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
   fillModelRequested: 'AUTO' | 'NEXT_OPEN' | 'ON_CLOSE';
   fillModelApplied: 'NEXT_OPEN' | 'ON_CLOSE';
@@ -16,12 +17,25 @@ type RunDetailResponse = Readonly<{
   eventCount: number;
   lastSeq: number;
   lastEventAt?: string;
+  runConfig: Readonly<{
+    strategyVersion: string;
+    updatedAt: string;
+    riskSnapshot: Readonly<{
+      dailyLossLimitPct: number;
+      maxConsecutiveLosses: number;
+      maxDailyOrders: number;
+      killSwitch: boolean;
+    }>;
+  }>;
   kpi: Readonly<{
     trades: number;
     exits: number;
     winRate: number;
     sumReturnPct: number;
     mddPct: number;
+    profitFactor: number;
+    avgWinPct: number;
+    avgLossPct: number;
   }>;
 }>;
 
@@ -41,6 +55,7 @@ export function ReportRunDetailPage() {
         <Descriptions column={1} size="small">
           <Descriptions.Item label="런 ID(runId)">{data?.runId ?? runId}</Descriptions.Item>
           <Descriptions.Item label="전략 ID(strategyId)">{data?.strategyId ?? '-'}</Descriptions.Item>
+          <Descriptions.Item label="전략 버전(strategyVersion)">{data?.strategyVersion ?? '-'}</Descriptions.Item>
           <Descriptions.Item label="적용 체결 모델(fillModelApplied)">{data?.fillModelApplied ?? '-'}</Descriptions.Item>
           <Descriptions.Item label="진입 정책(entryPolicy)">{data?.entryPolicy ?? '-'}</Descriptions.Item>
           <Descriptions.Item label="거래 수(kpi.trades)">{data?.kpi.trades ?? 0}</Descriptions.Item>
@@ -48,6 +63,23 @@ export function ReportRunDetailPage() {
           <Descriptions.Item label="승률(kpi.winRate)">{data ? `${data.kpi.winRate.toFixed(2)}%` : '0.00%'}</Descriptions.Item>
           <Descriptions.Item label="누적 수익률(kpi.sumReturnPct)">{data ? `${data.kpi.sumReturnPct.toFixed(4)}%` : '0.0000%'}</Descriptions.Item>
           <Descriptions.Item label="최대 낙폭(kpi.mddPct)">{data ? `${data.kpi.mddPct.toFixed(4)}%` : '0.0000%'}</Descriptions.Item>
+          <Descriptions.Item label="손익비(kpi.profitFactor)">
+            {data ? (data.kpi.profitFactor >= 9999 ? '무한대' : data.kpi.profitFactor.toFixed(4)) : '-'}
+          </Descriptions.Item>
+          <Descriptions.Item label="평균 이익(kpi.avgWinPct)">{data ? `${data.kpi.avgWinPct.toFixed(4)}%` : '0.0000%'}</Descriptions.Item>
+          <Descriptions.Item label="평균 손실(kpi.avgLossPct)">{data ? `${data.kpi.avgLossPct.toFixed(4)}%` : '0.0000%'}</Descriptions.Item>
+          <Descriptions.Item label="리스크 한도(runConfig.riskSnapshot.dailyLossLimitPct)">
+            {data ? `${data.runConfig.riskSnapshot.dailyLossLimitPct}%` : '-'}
+          </Descriptions.Item>
+          <Descriptions.Item label="연속 손실 제한(runConfig.riskSnapshot.maxConsecutiveLosses)">
+            {data?.runConfig.riskSnapshot.maxConsecutiveLosses ?? '-'}
+          </Descriptions.Item>
+          <Descriptions.Item label="일일 주문 제한(runConfig.riskSnapshot.maxDailyOrders)">
+            {data?.runConfig.riskSnapshot.maxDailyOrders ?? '-'}
+          </Descriptions.Item>
+          <Descriptions.Item label="킬스위치(runConfig.riskSnapshot.killSwitch)">
+            {data?.runConfig.riskSnapshot.killSwitch ? '활성' : '비활성'}
+          </Descriptions.Item>
         </Descriptions>
       </Card>
     </div>

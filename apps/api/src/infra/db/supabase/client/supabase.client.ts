@@ -9,6 +9,18 @@ type SupabaseInsertResult = Readonly<{ ok: boolean; reason?: string }>;
 type StrategyId = 'STRAT_A' | 'STRAT_B' | 'STRAT_C';
 type RunMode = 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
 
+export type PersistedRunRow = Readonly<{
+  runId: string;
+  strategyId: StrategyId;
+  strategyVersion: string;
+  mode: RunMode;
+  market: string;
+  fillModelRequested: string;
+  fillModelApplied?: string;
+  createdAt: string;
+  updatedAt?: string;
+}>;
+
 type RunShellInsert = Readonly<{
   run_id: string;
   strategy_id: StrategyId;
@@ -17,6 +29,16 @@ type RunShellInsert = Readonly<{
   market: string;
   timeframes: readonly string[];
   fill_model_requested: string;
+}>;
+
+type RunShellUpdate = Readonly<{
+  strategy_id?: StrategyId;
+  strategy_version?: string;
+  mode?: RunMode;
+  market?: string;
+  fill_model_requested?: string;
+  fill_model_applied?: string;
+  updated_at?: string;
 }>;
 
 @Injectable()
@@ -68,13 +90,6 @@ export class SupabaseClientService {
       const notFound = parsed.status === 404;
 
       if (duplicate) {
-        this.logger.warn('Duplicate run event insert ignored', {
-          source: 'infra.db.supabase.safeInsertRunEvent',
-          eventType: SYSTEM_EVENT_TYPE.EVENT_DUPLICATED,
-          runId: event.runId,
-          traceId: event.traceId,
-          payload: { seq: event.seq }
-        });
         return { ok: true, reason: 'duplicate' };
       }
 
@@ -130,6 +145,100 @@ export class SupabaseClientService {
         payload: { seq: event.seq, reason: message }
       });
       return { ok: false, reason: 'write_failed' };
+    }
+  }
+
+  async listRuns(limit = 30): Promise<readonly PersistedRunRow[]> {
+    const ctrl = new AbortController();
+    const rows = await this.rest.get<unknown[]>(
+      `text_runs?select=run_id,strategy_id,strategy_version,mode,market,fill_model_requested,fill_model_applied,created_at,updated_at&order=created_at.desc&limit=${Math.max(1, Math.min(limit, 100))}`,
+      ctrl.signal
+    );
+    return rows
+      .map(parsePersistedRunRow)
+      .filter((row): row is PersistedRunRow => row !== undefined);
+  }
+
+  async getRun(runId: string): Promise<PersistedRunRow | undefined> {
+    const ctrl = new AbortController();
+    const rows = await this.rest.get<unknown[]>(
+      `text_runs?select=run_id,strategy_id,strategy_version,mode,market,fill_model_requested,fill_model_applied,created_at,updated_at&run_id=eq.${encodeURIComponent(runId)}&limit=1`,
+      ctrl.signal
+    );
+    const first = Array.isArray(rows) ? rows[0] : undefined;
+    return parsePersistedRunRow(first);
+  }
+
+  async listRunEvents(runId: string, limit = 500): Promise<readonly WsEventEnvelopeDto[]> {
+    const ctrl = new AbortController();
+    const rows = await this.rest.get<unknown[]>(
+      `text_run_events?select=run_id,seq,event_type,event_ts,payload&run_id=eq.${encodeURIComponent(runId)}&order=seq.asc&limit=${Math.max(1, Math.min(limit, 2000))}`,
+      ctrl.signal
+    );
+    return rows
+      .map(parsePersistedEventRow)
+      .filter((row): row is WsEventEnvelopeDto => row !== undefined);
+  }
+
+  async getLastRunEventSeq(runId: string): Promise<number> {
+    const ctrl = new AbortController();
+    const rows = await this.rest.get<unknown[]>(
+      `text_run_events?select=seq&run_id=eq.${encodeURIComponent(runId)}&order=seq.desc&limit=1`,
+      ctrl.signal
+    );
+    const first = Array.isArray(rows) ? rows[0] : undefined;
+    if (!first || typeof first !== 'object' || Array.isArray(first)) {
+      return 0;
+    }
+    const seq = (first as Record<string, unknown>).seq;
+    return typeof seq === 'number' && Number.isFinite(seq) ? seq : 0;
+  }
+
+  async updateRunShell(
+    runId: string,
+    input: Readonly<{
+      strategyId?: StrategyId;
+      strategyVersion?: string;
+      mode?: RunMode;
+      market?: string;
+      fillModelRequested?: string;
+      fillModelApplied?: string;
+    }>
+  ): Promise<void> {
+    const payload: RunShellUpdate = {
+      ...(input.strategyId ? { strategy_id: input.strategyId } : {}),
+      ...(input.strategyVersion ? { strategy_version: input.strategyVersion } : {}),
+      ...(input.mode ? { mode: input.mode } : {}),
+      ...(input.market ? { market: input.market } : {}),
+      ...(input.fillModelRequested ? { fill_model_requested: input.fillModelRequested } : {}),
+      ...(input.fillModelApplied ? { fill_model_applied: input.fillModelApplied } : {}),
+      updated_at: new Date().toISOString()
+    };
+
+    if (Object.keys(payload).length === 0) {
+      return;
+    }
+
+    const ctrl = new AbortController();
+    try {
+      await this.rest.patch(
+        `text_runs?run_id=eq.${encodeURIComponent(runId)}`,
+        payload,
+        ctrl.signal
+      );
+    } catch (error: unknown) {
+      const parsed = parseSupabaseError(error);
+      this.logger.warn('Run control persistence skipped', {
+        source: 'infra.db.supabase.updateRunShell',
+        eventType: SYSTEM_EVENT_TYPE.SUPABASE_WRITE_FAILED,
+        runId,
+        payload: {
+          status: parsed.status,
+          code: parsed.code,
+          hint: parsed.hint,
+          reason: parsed.message
+        }
+      });
     }
   }
 
@@ -249,6 +358,78 @@ function parseRunMode(value: unknown): RunMode | undefined {
   return value === 'PAPER' || value === 'SEMI_AUTO' || value === 'AUTO' || value === 'LIVE'
     ? value
     : undefined;
+}
+
+function parsePersistedRunRow(value: unknown): PersistedRunRow | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const row = value as Record<string, unknown>;
+  const runId = row.run_id;
+  const strategyId = parseStrategyId(row.strategy_id);
+  const strategyVersion = row.strategy_version;
+  const mode = parseRunMode(row.mode);
+  const market = row.market;
+  const fillModelRequested = row.fill_model_requested;
+  const createdAt = row.created_at;
+  const fillModelApplied = row.fill_model_applied;
+  const updatedAt = row.updated_at;
+
+  if (
+    typeof runId !== 'string' ||
+    !strategyId ||
+    typeof strategyVersion !== 'string' ||
+    !mode ||
+    typeof market !== 'string' ||
+    typeof fillModelRequested !== 'string' ||
+    typeof createdAt !== 'string'
+  ) {
+    return undefined;
+  }
+
+  return {
+    runId,
+    strategyId,
+    strategyVersion,
+    mode,
+    market,
+    fillModelRequested,
+    ...(typeof fillModelApplied === 'string' ? { fillModelApplied } : {}),
+    createdAt,
+    ...(typeof updatedAt === 'string' ? { updatedAt } : {})
+  };
+}
+
+function parsePersistedEventRow(value: unknown): WsEventEnvelopeDto | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const row = value as Record<string, unknown>;
+  const runId = row.run_id;
+  const seq = row.seq;
+  const eventType = row.event_type;
+  const eventTs = row.event_ts;
+  const payload = row.payload;
+
+  if (
+    typeof runId !== 'string' ||
+    typeof seq !== 'number' ||
+    typeof eventType !== 'string' ||
+    typeof eventTs !== 'string'
+  ) {
+    return undefined;
+  }
+
+  return {
+    runId,
+    seq,
+    traceId: `persisted-${runId}-${seq}`,
+    eventType,
+    eventTs,
+    payload: toRecord(payload)
+  };
 }
 
 function isDuplicateSupabaseError(error: unknown): boolean {

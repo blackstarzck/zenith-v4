@@ -8,6 +8,7 @@ export type UpbitMinuteCandleDto = Readonly<{
   high_price: number;
   low_price: number;
   trade_price: number;
+  candle_acc_trade_volume?: number;
   timestamp: number;
 }>;
 

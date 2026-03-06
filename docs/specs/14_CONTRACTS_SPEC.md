@@ -212,11 +212,13 @@ export type WsEventEnvelopeDto<TPayload = Readonly<Record<string, unknown>>> = R
 ---
 
 ## 9) API 엔드포인트(현재 구현)
-- `GET /runs/history`
+- `GET /runs/history?strategyId=&strategyVersion=&mode=&market=&from=&to=`
 - `GET /runs/:runId`
+- `GET /runs/:runId/config`
 - `GET /runs/:runId/candles?limit=300`
 - `GET /runs/:runId/events.jsonl`
 - `GET /runs/:runId/trades.csv`
+- `GET /reports/compare?strategyVersion=&from=&to=&mode=&market=`
 - `PATCH /runs/:runId/control`
   - body:
     - `strategyId?: STRAT_A|STRAT_B|STRAT_C`
@@ -228,5 +230,27 @@ export type WsEventEnvelopeDto<TPayload = Readonly<Record<string, unknown>>> = R
 - `GET /ops/metrics`
   - runtime counters:
     - `wsConnections`, `wsDisconnections`
+    - `wsActiveClients`
     - `eventsIngested`, `marketTicks`, `signals`, `fills`, `exits`
+    - `dbWriteFailures`, `wsPushFailures`
+    - `runConfigMismatches`
+    - `upbitReconnectAttempts`, `upbitReconnectRecoveries`, `upbitAvgRecoveryMs`
+    - `lastDisconnectAt`
     - `lastEventAt`
+
+`GET /runs/history` 응답 KPI 필드(현재):
+- `trades`, `exits`
+- `winRate`, `sumReturnPct`, `mddPct`
+- `profitFactor`, `avgWinPct`, `avgLossPct`
+- `strategyVersion`
+
+`GET /runs/:runId` 응답 추가 필드(현재):
+- `runConfig`
+  - `strategyId`, `mode`, `market`
+  - `strategyVersion`
+  - `fillModelRequested`, `fillModelApplied`, `entryPolicy`
+  - `riskSnapshot.dailyLossLimitPct`
+  - `riskSnapshot.maxConsecutiveLosses`
+  - `riskSnapshot.maxDailyOrders`
+  - `riskSnapshot.killSwitch`
+  - `updatedAt`

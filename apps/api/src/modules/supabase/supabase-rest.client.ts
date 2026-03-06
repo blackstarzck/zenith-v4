@@ -25,10 +25,15 @@ export class SupabaseRestClient {
     return this.http.post(normalizedPath, payload, { signal }).then(() => undefined);
   }
 
-  get(path: string, signal: AbortSignal): Promise<Readonly<Record<string, unknown>>> {
+  patch(path: string, payload: unknown, signal: AbortSignal): Promise<void> {
+    const normalizedPath = path.replace(/^\/+/, '');
+    return this.http.patch(normalizedPath, payload, { signal }).then(() => undefined);
+  }
+
+  get<T = unknown>(path: string, signal: AbortSignal): Promise<T> {
     const normalizedPath = path.replace(/^\/+/, '');
     return this.http
       .get(normalizedPath, { signal })
-      .then((response) => (response.data ?? {}) as Readonly<Record<string, unknown>>);
+      .then((response) => (response.data ?? {}) as T);
   }
 }

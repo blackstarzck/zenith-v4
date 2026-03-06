@@ -1,0 +1,105 @@
+export const PARAMETER_KEYS = Object.freeze({
+  common: {
+    mode: 'common.mode',
+    fillModel: 'common.fillModel',
+    market: 'common.market',
+    riskDailyLossLimitPct: 'common.risk.dailyLossLimitPct',
+    riskMaxConsecutiveLosses: 'common.risk.maxConsecutiveLosses',
+    riskMaxDailyOrders: 'common.risk.maxDailyOrders'
+  },
+  a: {
+    entryAfterConfirmFill: 'a.entry.afterConfirmFill',
+    executionPartialExitFillTiming: 'a.execution.partialExitFillTiming',
+    bbPeriod: 'a.bb.period',
+    bbStd: 'a.bb.std',
+    atrPeriod: 'a.atr.period',
+    adxPeriod: 'a.adx.period',
+    rsiPeriod: 'a.rsi.period',
+    rsiSlopeLookback: 'a.rsi.slopeLookback',
+    filtersExcludeEntryHoursKst: 'a.filters.excludeEntryHoursKst',
+    filtersMaxAdx: 'a.filters.maxAdx',
+    filtersRsiSlopeMin: 'a.filters.rsiSlopeMin',
+    tpPct: 'a.tp.tpPct',
+    partialRatio: 'a.tp.partialRatio',
+    trailAtrMult: 'a.trail.atrMult',
+    timeExitMaxHoldBars: 'a.timeExit.maxHoldBars',
+    stopMultRanging: 'a.stop.multRanging',
+    stopMultTrending: 'a.stop.multTrending',
+    stopMultVolatile: 'a.stop.multVolatile'
+  },
+  b: {
+    requireUserConfirm: 'b.execution.requireUserConfirm',
+    approvalDelayBars: 'b.approval.delayBars',
+    entryFillWhenAuto: 'b.entry.fillWhenAuto',
+    entryFillWhenSemiAuto: 'b.entry.fillWhenSemiAuto',
+    atrPeriod: 'b.atr.period',
+    impulseMult: 'b.impulse.mult',
+    impulseBodyRatioMin: 'b.impulse.bodyRatioMin',
+    poiValidBars: 'b.poi.validBars',
+    obLookback: 'b.ob.lookback',
+    slBuffer: 'b.sl.buffer',
+    tpRrFallback: 'b.tp.rrFallback',
+    timeExitBars: 'b.timeExit.bars'
+  },
+  c: {
+    entryAllowedHoursKst: 'c.entry.allowedHoursKst',
+    breakoutLookbackCandles: 'c.breakout.lookbackCandles',
+    valueSpikeLookbackCandles: 'c.valueSpike.lookbackCandles',
+    valueSpikeMult: 'c.valueSpike.mult',
+    buyRatioMin: 'c.buyRatio.min',
+    bodyRatioMin: 'c.bodyRatio.min',
+    tp1Pct: 'c.tp1.pct',
+    tp1Ratio: 'c.tp1.ratio',
+    tp2Pct: 'c.tp2.pct',
+    tp2Ratio: 'c.tp2.ratio',
+    slPct: 'c.sl.pct',
+    timeStopMinutes: 'c.timeStop.minutes'
+  }
+});
+
+export const DEFAULT_PARAMETER_VALUES = Object.freeze({
+  a: {
+    bbPeriod: 20,
+    bbStd: 2.0,
+    atrPeriod: 14,
+    adxPeriod: 14,
+    rsiPeriod: 14,
+    rsiSlopeLookback: 3,
+    filtersExcludeEntryHoursKst: [13] as const,
+    filtersMaxAdx: 35,
+    filtersRsiSlopeMin: 1.0,
+    tpPct: 0.6,
+    partialRatio: 0.5,
+    trailAtrMult: 1.2,
+    timeExitMaxHoldBars: 10,
+    stopMultRanging: 3.5,
+    stopMultTrending: 2.2,
+    stopMultVolatile: 2.5
+  },
+  b: {
+    requireUserConfirm: true,
+    approvalDelayBars: 1,
+    atrPeriod: 14,
+    impulseMult: 1.5,
+    impulseBodyRatioMin: 0.5,
+    poiValidBars: 48,
+    obLookback: 10,
+    slBuffer: 0.002,
+    tpRrFallback: 1.5,
+    timeExitBars: 24
+  },
+  c: {
+    entryAllowedHoursKst: [6, 7, 10, 14, 16, 20, 22] as const,
+    breakoutLookbackCandles: 10,
+    valueSpikeLookbackCandles: 30,
+    valueSpikeMult: 4.0,
+    buyRatioMin: 0.75,
+    bodyRatioMin: 0.7,
+    tp1Pct: 0.4,
+    tp1Ratio: 0.7,
+    tp2Pct: 0.6,
+    tp2Ratio: 0.3,
+    slPct: 0.4,
+    timeStopMinutes: 5
+  }
+});

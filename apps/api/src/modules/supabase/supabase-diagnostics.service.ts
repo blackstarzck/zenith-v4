@@ -14,6 +14,10 @@ export class SupabaseDiagnosticsService implements OnModuleInit {
   ) {}
 
   async onModuleInit(): Promise<void> {
+    void this.runDiagnostics();
+  }
+
+  private async runDiagnostics(): Promise<void> {
     try {
       await this.retryPolicy.runWithRetry(
         async (signal) => {

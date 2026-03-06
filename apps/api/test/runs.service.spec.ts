@@ -140,6 +140,42 @@ test('RunsService computes KPI from EXIT pnl events', () => {
   assert.equal(run?.kpi.winRate, 50);
   assert.equal(run?.kpi.sumReturnPct, 0.5);
   assert.equal(run?.kpi.mddPct, -0.7);
+  assert.equal(run?.kpi.profitFactor, 1.7143);
+  assert.equal(run?.kpi.avgWinPct, 1.2);
+  assert.equal(run?.kpi.avgLossPct, -0.7);
+});
+
+test('RunsService ignores legacy fill events without side/fillPrice in trade counts', () => {
+  const svc = new RunsService();
+  svc.seedRun('run-legacy-fill');
+
+  const events: WsEventEnvelopeDto[] = [
+    {
+      runId: 'run-legacy-fill',
+      seq: 1,
+      traceId: 'legacy-fill',
+      eventType: 'FILL',
+      eventTs: new Date().toISOString(),
+      payload: { message: 'simulated event #1' }
+    },
+    {
+      runId: 'run-legacy-fill',
+      seq: 2,
+      traceId: 'real-fill',
+      eventType: 'FILL',
+      eventTs: new Date().toISOString(),
+      payload: { side: 'BUY', fillPrice: 100 }
+    }
+  ];
+
+  events.forEach((event) => svc.ingestEvent(event));
+
+  const run = svc.getRun('run-legacy-fill');
+  const csv = svc.getTradesCsv('run-legacy-fill');
+
+  assert.equal(run?.kpi.trades, 1);
+  assert.ok(csv?.includes('T-0001'));
+  assert.ok(!csv?.includes('T-0002'));
 });
 
 test('RunsService updates run control fields', () => {
@@ -148,6 +184,7 @@ test('RunsService updates run control fields', () => {
 
   const updated = svc.updateRunControl('run-ctl', {
     strategyId: 'STRAT_C',
+    strategyVersion: 'v2',
     mode: 'AUTO',
     market: 'KRW-BTC',
     fillModelRequested: 'NEXT_OPEN',
@@ -156,9 +193,72 @@ test('RunsService updates run control fields', () => {
   });
 
   assert.equal(updated?.strategyId, 'STRAT_C');
+  assert.equal(updated?.strategyVersion, 'v2');
   assert.equal(updated?.mode, 'AUTO');
   assert.equal(updated?.market, 'KRW-BTC');
   assert.equal(updated?.fillModelRequested, 'NEXT_OPEN');
   assert.equal(updated?.fillModelApplied, 'ON_CLOSE');
   assert.equal(updated?.entryPolicy, 'CUSTOM');
+
+  const config = svc.getRunConfig('run-ctl');
+  assert.equal(config?.strategyId, 'STRAT_C');
+  assert.equal(config?.strategyVersion, 'v2');
+  assert.equal(config?.mode, 'AUTO');
+  assert.equal(config?.market, 'KRW-BTC');
+});
+
+test('RunsService filters run history by strategy/mode/market', () => {
+  const svc = new RunsService();
+  svc.seedRun('run-a-paper', { strategyId: 'STRAT_A', strategyVersion: 'v1', mode: 'PAPER', market: 'KRW-BTC' });
+  svc.seedRun('run-a-auto', { strategyId: 'STRAT_A', strategyVersion: 'v2', mode: 'AUTO', market: 'KRW-XRP' });
+  svc.seedRun('run-b-paper', { strategyId: 'STRAT_B', strategyVersion: 'v2', mode: 'PAPER', market: 'KRW-XRP' });
+
+  const byStrategy = svc.listRuns({ strategyId: 'STRAT_A' });
+  assert.equal(byStrategy.length, 2);
+
+  const byMode = svc.listRuns({ mode: 'PAPER' });
+  assert.equal(byMode.length, 2);
+
+  const byMarket = svc.listRuns({ market: 'KRW-XRP' });
+  assert.equal(byMarket.length, 2);
+
+  const byVersion = svc.listRuns({ strategyVersion: 'v2' });
+  assert.equal(byVersion.length, 2);
+
+  const composite = svc.listRuns({ strategyId: 'STRAT_A', mode: 'AUTO', market: 'KRW-XRP' });
+  assert.equal(composite.length, 1);
+  assert.equal(composite[0]?.runId, 'run-a-auto');
+});
+
+test('RunsService validates event payload against runConfig snapshot', () => {
+  const svc = new RunsService();
+  svc.seedRun('run-match', { strategyId: 'STRAT_B', strategyVersion: 'v1', mode: 'PAPER', market: 'KRW-XRP' });
+
+  const mismatched: WsEventEnvelopeDto = {
+    runId: 'run-match',
+    seq: 1,
+    traceId: 'trace-mismatch',
+    eventType: 'SIGNAL_EMIT',
+    eventTs: new Date().toISOString(),
+    payload: { strategyId: 'STRAT_A', strategyVersion: 'v3', market: 'KRW-BTC' }
+  };
+
+  const mismatches = svc.validateEventAgainstRunConfig(mismatched);
+  assert.equal(mismatches.length, 3);
+  assert.deepEqual(mismatches[0], { field: 'strategyId', expected: 'STRAT_B', actual: 'STRAT_A' });
+  assert.deepEqual(mismatches[1], { field: 'strategyVersion', expected: 'v1', actual: 'v3' });
+  assert.deepEqual(mismatches[2], { field: 'market', expected: 'KRW-XRP', actual: 'KRW-BTC' });
+});
+
+test('RunsService approve token can be queued and consumed once', () => {
+  const svc = new RunsService();
+  svc.seedRun('run-approve');
+
+  const approved = svc.approvePendingEntry('run-approve');
+  const consumedFirst = svc.consumeApproval('run-approve');
+  const consumedSecond = svc.consumeApproval('run-approve');
+
+  assert.equal(approved, true);
+  assert.equal(consumedFirst, true);
+  assert.equal(consumedSecond, false);
 });

@@ -10,12 +10,6 @@ export class SequenceGuardService {
     const prev = this.lastSeqMap.get(runId) ?? 0;
 
     if (seq === prev) {
-      this.logger.warn('Duplicate event sequence ignored', {
-        source,
-        eventType: SYSTEM_EVENT_TYPE.EVENT_DUPLICATED,
-        runId,
-        payload: { prev, seq }
-      });
       return 'duplicate';
     }
 

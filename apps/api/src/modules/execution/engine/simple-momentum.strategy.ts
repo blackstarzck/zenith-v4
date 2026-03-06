@@ -11,6 +11,45 @@ export type MomentumConfig = Readonly<{
   takeProfitPct: number;
   stopLossPct: number;
   maxHoldBars: number;
+  stratA?: Readonly<{
+    bbPeriod: number;
+    bbStd: number;
+    atrPeriod: number;
+    adxPeriod: number;
+    rsiPeriod: number;
+    rsiSlopeLookback: number;
+    excludeEntryHoursKst: readonly number[];
+    maxAdx: number;
+    rsiSlopeMin: number;
+    tpPct: number;
+    partialRatio: number;
+    trailAtrMult: number;
+    timeExitMaxHoldBars: number;
+    stopMultRanging: number;
+    stopMultTrending: number;
+    stopMultVolatile: number;
+  }>;
+  stratB?: Readonly<{
+    atrPeriod: number;
+    impulseMult: number;
+    impulseBodyRatioMin: number;
+    poiValidBars: number;
+    obLookback: number;
+    slBuffer: number;
+    tpRrFallback: number;
+  }>;
+  stratC?: Readonly<{
+    allowedHoursKst: readonly number[];
+    breakoutLookbackCandles: number;
+    valueSpikeLookbackCandles: number;
+    valueSpikeMult: number;
+    buyRatioMin: number;
+    bodyRatioMin: number;
+    tp1Pct: number;
+    tp2Pct: number;
+    slPct: number;
+    timeStopMinutes: number;
+  }>;
 }>;
 
 export type MomentumState = Readonly<{
@@ -25,6 +64,7 @@ export type MomentumState = Readonly<{
   stratB?: Readonly<{
     poiLow?: number;
     poiHigh?: number;
+    poiExpiresAt?: number;
   }>;
 }>;
 

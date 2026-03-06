@@ -5,7 +5,7 @@
 - 초기에는 **가상 시드 1,000,000 KRW**로 전략별 가상 매수/매도(페이퍼) 테스트.
 - 이후 업비트 실계정(약 240,000 KRW)은 옵션으로 전환.
 
-## 문서 맵 (00~21)
+## 문서 맵 (00~22)
 - 00 인덱스: `00_INDEX.md`
 - 02 개발 가이드: `../guides/02_DEV_GUIDE.md`
 - 03 주석 규칙: `../guides/03_COMMENT_RULES.md`
@@ -27,6 +27,7 @@
 - 19 Supabase SQL 런북(실행 순서/검증 쿼리): `../specs/19_SUPABASE_SQL_RUNBOOK.md`
 - 20 용어집(트레이딩/실시간 시스템): `../specs/20_TERMS_GLOSSARY.md`
 - 21 남은 작업 핸드오프: `../ops/21_REMAINING_TASKS_HANDOFF.md`
+- 22 런타임 E2E 체크리스트: `../ops/22_RUNTIME_E2E_CHECKLIST.md`
 
 ## 중요 원칙(실전/실시간 목적)
 - 엔진 계약(체결 타이밍, 승인 흐름, 우선순위, 수수료 모델)은 **06에서만 정의**한다.
