@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Card, Segmented, Select, Space, Table, Typography } from 'antd';
 import { httpGet } from '../../../shared/api/http';
+import { UI_COLOR } from '../../../shared/ui/color-semantic';
 
 const { Title } = Typography;
 
@@ -236,27 +237,27 @@ export function ReportComparePage() {
           })}
           <polyline
             fill="none"
-            stroke="#2563eb"
+            stroke={UI_COLOR.status.info}
             strokeWidth="2"
             points={trendData.points.STRAT_A.map((p) => `${p.x},${p.y}`).join(' ')}
           />
           <polyline
             fill="none"
-            stroke="#16a34a"
+            stroke={UI_COLOR.status.success}
             strokeWidth="2"
             points={trendData.points.STRAT_B.map((p) => `${p.x},${p.y}`).join(' ')}
           />
           <polyline
             fill="none"
-            stroke="#dc2626"
+            stroke={UI_COLOR.status.error}
             strokeWidth="2"
             points={trendData.points.STRAT_C.map((p) => `${p.x},${p.y}`).join(' ')}
           />
         </svg>
         <Space size={18} style={{ marginTop: 8 }}>
-          <span style={{ color: '#2563eb' }}>STRAT_A</span>
-          <span style={{ color: '#16a34a' }}>STRAT_B</span>
-          <span style={{ color: '#dc2626' }}>STRAT_C</span>
+          <span style={{ color: UI_COLOR.status.info }}>STRAT_A</span>
+          <span style={{ color: UI_COLOR.status.success }}>STRAT_B</span>
+          <span style={{ color: UI_COLOR.status.error }}>STRAT_C</span>
         </Space>
       </Card>
     </div>

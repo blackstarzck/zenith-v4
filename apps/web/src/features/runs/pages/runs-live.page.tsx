@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { WsEventEnvelopeDto } from '@zenith/contracts';
+import {
+  CONNECTION_STATE,
+  type RealtimeStatusDto,
+  type WsEventEnvelopeDto
+} from '@zenith/contracts';
 import {
   Alert,
   Button,
@@ -7,10 +11,10 @@ import {
   Col,
   Empty,
   Flex,
+  message,
   Row,
   Select,
   Space,
-  Statistic,
   Table,
   Tag,
   Typography
@@ -28,6 +32,8 @@ import {
 import { RealtimeStatusBadge } from '../../../shared/realtime/components/realtime-status-badge';
 import { useRealtimeStatus } from '../../../shared/realtime/hooks/use-realtime-status';
 import { useRunEventsSocket } from '../../../shared/realtime/hooks/use-run-events-socket';
+import type { RealtimeStatus } from '../../../shared/realtime/types/realtime-status';
+import { UI_COLOR, getSignedMetricColor } from '../../../shared/ui/color-semantic';
 
 const { Title, Text } = Typography;
 
@@ -53,6 +59,11 @@ const STRATEGY_CHART_THEME = {
 const LIVE_RUN_ID = 'run-dev-0001';
 const DEFAULT_SEED_CAPITAL_KRW = Number(import.meta.env.VITE_SEED_CAPITAL_KRW ?? '1000000');
 const MARKET_STREAM_STALE_THRESHOLD_MS = 30_000;
+const DEFAULT_RUN_ID_BY_STRATEGY = {
+  STRAT_A: 'run-strat-a-0001',
+  STRAT_B: 'run-strat-b-0001',
+  STRAT_C: 'run-strat-c-0001'
+} as const;
 
 type RunMode = 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
 type StrategyId = (typeof STRATEGY_IDS)[number];
@@ -72,6 +83,8 @@ type RunKpi = Readonly<{
 }>;
 
 type RiskSnapshot = Readonly<{
+  seedKrw: number;
+  maxPositionRatio: number;
   dailyLossLimitPct: number;
   maxConsecutiveLosses: number;
   maxDailyOrders: number;
@@ -118,6 +131,8 @@ type RunDetail = Readonly<{
   runConfig: RunConfig;
   events: readonly WsEventEnvelopeDto[];
   kpi: RunKpi;
+  latestEntryReadiness?: EntryReadinessSnapshot;
+  realtimeStatus?: RealtimeStatusDto;
 }>;
 
 type TradeRow = Readonly<{
@@ -125,8 +140,29 @@ type TradeRow = Readonly<{
   eventTs: string;
   seq: number;
   side: string;
+  qty: string;
   fillPrice: string;
+  notionalKrw: string;
   traceId: string;
+}>;
+
+type StrategySummaryRow = Readonly<{
+  key: StrategyId;
+  strategyId: StrategyId;
+  strategyLabel: string;
+  runId?: string;
+  totalPnlKrw: number;
+  totalPnlPct: number;
+  positionQty: number;
+  avgEntryPriceKrw: number;
+  avgWinPct: number;
+  avgLossPct: number;
+  todayPnlAmount: number;
+  mddPct: number;
+  entryReadinessPct: number;
+  entryReadinessColor: string;
+  winRate: number;
+  sumReturnPct: number;
 }>;
 
 type StrategySection = Readonly<{
@@ -140,16 +176,137 @@ type StrategySection = Readonly<{
   entryPolicy?: string;
   runConfig?: RunConfig;
   kpi?: RunKpi;
+  latestEntryReadiness?: EntryReadinessSnapshot;
+  realtimeStatus?: RealtimeStatus;
   events: readonly WsEventEnvelopeDto[];
   candles: readonly ChartCandle[];
   gapCount: number;
 }>;
 
 type StrategySections = Readonly<Record<StrategyId, StrategySection>>;
+type StrategyFillEvents = Readonly<Record<StrategyId, readonly WsEventEnvelopeDto[]>>;
+type StrategyFillPagination = Readonly<Record<StrategyId, Readonly<{ page: number; pageSize: number; total: number }>>>;
+type StrategyFillPageResponse = Readonly<{
+  items: readonly WsEventEnvelopeDto[];
+  total: number;
+  page: number;
+  pageSize: number;
+}>;
+
+type StrategyAccountSummary = Readonly<{
+  strategyId: StrategyId;
+  seedCapitalKrw: number;
+  cashKrw: number;
+  positionQty: number;
+  avgEntryPriceKrw: number;
+  markPriceKrw: number;
+  marketValueKrw: number;
+  equityKrw: number;
+  realizedPnlKrw: number;
+  unrealizedPnlKrw: number;
+  totalPnlKrw: number;
+  totalPnlPct: number;
+  fillCount: number;
+  lastFillAt?: string;
+}>;
+
+type StrategyAccountSummaries = Readonly<Record<StrategyId, StrategyAccountSummary | undefined>>;
+type StrategyEntryReadinessById = Readonly<Record<StrategyId, EntryReadinessSnapshot | undefined>>;
+const ZERO_KPI: RunKpi = {
+  trades: 0,
+  exits: 0,
+  winRate: 0,
+  sumReturnPct: 0,
+  mddPct: 0,
+  profitFactor: 0,
+  avgWinPct: 0,
+  avgLossPct: 0
+};
+
+const EMPTY_ENTRY_READINESS_SNAPSHOT: EntryReadinessSnapshot = {
+  entryReadinessPct: 0,
+  entryReady: false,
+  entryExecutable: false,
+  reason: 'ENTRY_WAIT',
+  inPosition: false
+};
+
+function toRealtimeStatus(input?: RealtimeStatusDto): RealtimeStatus | undefined {
+  if (!input) {
+    return undefined;
+  }
+
+  const lastEventAtMs = input.lastEventAt ? Date.parse(input.lastEventAt) : Number.NaN;
+  const isStale = Number.isFinite(lastEventAtMs)
+    ? Date.now() - lastEventAtMs > input.staleThresholdMs
+    : false;
+
+  return {
+    connectionState: input.connectionState,
+    isPending: false,
+    isStale,
+    retryCount: input.retryCount ?? 0,
+    ...(input.lastEventAt ? { lastEventAt: input.lastEventAt } : {}),
+    ...(typeof input.queueDepth === 'number' ? { queueDepth: input.queueDepth } : {}),
+    ...(typeof input.nextRetryInMs === 'number' ? { nextRetryInMs: input.nextRetryInMs } : {}),
+    staleThresholdMs: input.staleThresholdMs
+  };
+}
+
+function touchRealtimeStatus(status: RealtimeStatus | undefined, eventTs: string): RealtimeStatus {
+  const queueDepth = status?.queueDepth;
+  const connectionState = status?.connectionState === CONNECTION_STATE.RECONNECTING ||
+    status?.connectionState === CONNECTION_STATE.PAUSED ||
+    status?.connectionState === CONNECTION_STATE.ERROR
+    ? status.connectionState
+    : (typeof queueDepth === 'number' && queueDepth > 0
+      ? CONNECTION_STATE.DELAYED
+      : CONNECTION_STATE.LIVE);
+
+  return {
+    connectionState,
+    isPending: status?.isPending ?? false,
+    isStale: false,
+    retryCount: status?.retryCount ?? 0,
+    lastEventAt: eventTs,
+    ...(typeof queueDepth === 'number' ? { queueDepth } : {}),
+    ...(typeof status?.nextRetryInMs === 'number' ? { nextRetryInMs: status.nextRetryInMs } : {}),
+    ...(typeof status?.staleThresholdMs === 'number' ? { staleThresholdMs: status.staleThresholdMs } : {})
+  };
+}
+
+function resolveDisplayRealtimeStatus(
+  sectionStatus: RealtimeStatus | undefined,
+  liveStatus: RealtimeStatus,
+  isControlTarget: boolean
+): RealtimeStatus {
+  if (!sectionStatus || !isControlTarget) {
+    return sectionStatus ?? liveStatus;
+  }
+
+  const overlayTransport = liveStatus.connectionState === CONNECTION_STATE.RECONNECTING ||
+    liveStatus.connectionState === CONNECTION_STATE.PAUSED ||
+    liveStatus.connectionState === CONNECTION_STATE.ERROR;
+  const nextRetryInMs = overlayTransport ? liveStatus.nextRetryInMs : sectionStatus.nextRetryInMs;
+  const lastEventAt = liveStatus.lastEventAt ?? sectionStatus.lastEventAt;
+
+  return {
+    ...sectionStatus,
+    connectionState: overlayTransport ? liveStatus.connectionState : sectionStatus.connectionState,
+    isPending: liveStatus.isPending,
+    isStale: sectionStatus.isStale || liveStatus.isStale,
+    retryCount: overlayTransport ? liveStatus.retryCount : sectionStatus.retryCount,
+    ...(lastEventAt ? { lastEventAt } : {}),
+    ...(typeof nextRetryInMs === 'number' ? { nextRetryInMs } : {}),
+    ...(typeof sectionStatus.queueDepth === 'number' ? { queueDepth: sectionStatus.queueDepth } : {}),
+    ...(typeof sectionStatus.staleThresholdMs === 'number' ? { staleThresholdMs: sectionStatus.staleThresholdMs } : {})
+  };
+}
 
 function createEmptySection(strategyId: StrategyId): StrategySection {
   return {
     strategyId,
+    runId: DEFAULT_RUN_ID_BY_STRATEGY[strategyId],
     events: [],
     candles: [],
     gapCount: 0
@@ -164,8 +321,211 @@ function createInitialSections(): StrategySections {
   };
 }
 
+function createInitialFillEvents(): StrategyFillEvents {
+  return {
+    STRAT_A: [],
+    STRAT_B: [],
+    STRAT_C: []
+  };
+}
+
+function createInitialFillPagination(): StrategyFillPagination {
+  return {
+    STRAT_A: { page: 1, pageSize: 50, total: 0 },
+    STRAT_B: { page: 1, pageSize: 50, total: 0 },
+    STRAT_C: { page: 1, pageSize: 50, total: 0 }
+  };
+}
+
+function createInitialAccountSummaries(): StrategyAccountSummaries {
+  return {
+    STRAT_A: undefined,
+    STRAT_B: undefined,
+    STRAT_C: undefined
+  };
+}
+
+function roundMoney(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Number(value.toFixed(2));
+}
+
+function roundQty(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Number(value.toFixed(8));
+}
+
+function roundPct(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Number(value.toFixed(4));
+}
+
+function createEmptyAccountSummary(
+  strategyId: StrategyId,
+  previous?: StrategyAccountSummary
+): StrategyAccountSummary {
+  const seedCapitalKrw = previous?.seedCapitalKrw ?? DEFAULT_SEED_CAPITAL_KRW;
+
+  return {
+    strategyId,
+    seedCapitalKrw,
+    cashKrw: previous?.cashKrw ?? seedCapitalKrw,
+    positionQty: previous?.positionQty ?? 0,
+    avgEntryPriceKrw: previous?.avgEntryPriceKrw ?? 0,
+    markPriceKrw: previous?.markPriceKrw ?? 0,
+    marketValueKrw: previous?.marketValueKrw ?? 0,
+    equityKrw: previous?.equityKrw ?? seedCapitalKrw,
+    realizedPnlKrw: previous?.realizedPnlKrw ?? 0,
+    unrealizedPnlKrw: previous?.unrealizedPnlKrw ?? 0,
+    totalPnlKrw: previous?.totalPnlKrw ?? 0,
+    totalPnlPct: previous?.totalPnlPct ?? 0,
+    fillCount: previous?.fillCount ?? 0,
+    ...(previous?.lastFillAt ? { lastFillAt: previous.lastFillAt } : {})
+  };
+}
+
+function finalizeAccountSummary(summary: StrategyAccountSummary): StrategyAccountSummary {
+  const effectiveMarkPriceKrw = summary.markPriceKrw > 0
+    ? summary.markPriceKrw
+    : summary.positionQty > 0
+      ? summary.avgEntryPriceKrw
+      : 0;
+  const marketValueKrw = summary.positionQty * effectiveMarkPriceKrw;
+  const equityKrw = summary.cashKrw + marketValueKrw;
+  const unrealizedPnlKrw = summary.positionQty > 0
+    ? (effectiveMarkPriceKrw - summary.avgEntryPriceKrw) * summary.positionQty
+    : 0;
+  const totalPnlKrw = equityKrw - summary.seedCapitalKrw;
+  const totalPnlPct = summary.seedCapitalKrw > 0 ? (totalPnlKrw / summary.seedCapitalKrw) * 100 : 0;
+
+  return {
+    ...summary,
+    cashKrw: roundMoney(summary.cashKrw),
+    positionQty: roundQty(summary.positionQty),
+    avgEntryPriceKrw: roundMoney(summary.avgEntryPriceKrw),
+    markPriceKrw: roundMoney(effectiveMarkPriceKrw),
+    marketValueKrw: roundMoney(marketValueKrw),
+    equityKrw: roundMoney(equityKrw),
+    realizedPnlKrw: roundMoney(summary.realizedPnlKrw),
+    unrealizedPnlKrw: roundMoney(unrealizedPnlKrw),
+    totalPnlKrw: roundMoney(totalPnlKrw),
+    totalPnlPct: roundPct(totalPnlPct)
+  };
+}
+
+function resolveFillQty(payload: Readonly<Record<string, unknown>>): number {
+  const qty = payload.qty;
+  if (typeof qty === 'number' && Number.isFinite(qty) && qty > 0) {
+    return qty;
+  }
+
+  const quantity = payload.quantity;
+  if (typeof quantity === 'number' && Number.isFinite(quantity) && quantity > 0) {
+    return quantity;
+  }
+
+  return 1;
+}
+
+function applyFillToAccountSummary(
+  strategyId: StrategyId,
+  previous: StrategyAccountSummary | undefined,
+  event: WsEventEnvelopeDto
+): StrategyAccountSummary | undefined {
+  if (event.eventType !== 'FILL') {
+    return previous;
+  }
+
+  const payload = event.payload as Readonly<Record<string, unknown>>;
+  const side = typeof payload.side === 'string' ? payload.side.toUpperCase() : '';
+  const fillPrice = typeof payload.fillPrice === 'number' && Number.isFinite(payload.fillPrice)
+    ? payload.fillPrice
+    : undefined;
+  const qty = resolveFillQty(payload);
+
+  if (!fillPrice || qty <= 0 || (side !== 'BUY' && side !== 'SELL')) {
+    return previous;
+  }
+
+  const base = createEmptyAccountSummary(strategyId, previous);
+  let nextCashKrw = base.cashKrw;
+  let nextPositionQty = base.positionQty;
+  let nextAvgEntryPriceKrw = base.avgEntryPriceKrw;
+  let nextRealizedPnlKrw = base.realizedPnlKrw;
+
+  if (side === 'BUY') {
+    const combinedQty = base.positionQty + qty;
+    nextAvgEntryPriceKrw = combinedQty > 0
+      ? ((base.avgEntryPriceKrw * base.positionQty) + (fillPrice * qty)) / combinedQty
+      : 0;
+    nextPositionQty = combinedQty;
+    nextCashKrw = base.cashKrw - (fillPrice * qty);
+  } else {
+    const matchedQty = Math.min(base.positionQty, qty);
+    if (matchedQty > 0) {
+      nextRealizedPnlKrw += (fillPrice - base.avgEntryPriceKrw) * matchedQty;
+    }
+    nextPositionQty = Math.max(0, base.positionQty - qty);
+    nextAvgEntryPriceKrw = nextPositionQty > 0 ? base.avgEntryPriceKrw : 0;
+    nextCashKrw = base.cashKrw + (fillPrice * qty);
+  }
+
+  return finalizeAccountSummary({
+    ...base,
+    cashKrw: nextCashKrw,
+    positionQty: nextPositionQty,
+    avgEntryPriceKrw: nextAvgEntryPriceKrw,
+    markPriceKrw: fillPrice,
+    realizedPnlKrw: nextRealizedPnlKrw,
+    fillCount: base.fillCount + 1,
+    lastFillAt: event.eventTs
+  });
+}
+
+function applyMarkPriceToAccountSummary(
+  strategyId: StrategyId,
+  previous: StrategyAccountSummary | undefined,
+  markPriceKrw: number
+): StrategyAccountSummary | undefined {
+  if (!Number.isFinite(markPriceKrw) || markPriceKrw <= 0) {
+    return previous;
+  }
+
+  return finalizeAccountSummary({
+    ...createEmptyAccountSummary(strategyId, previous),
+    markPriceKrw
+  });
+}
+
+function createInitialEntryReadinessById(): StrategyEntryReadinessById {
+  return {
+    STRAT_A: EMPTY_ENTRY_READINESS_SNAPSHOT,
+    STRAT_B: EMPTY_ENTRY_READINESS_SNAPSHOT,
+    STRAT_C: EMPTY_ENTRY_READINESS_SNAPSHOT
+  };
+}
+
 function isStrategyId(value: unknown): value is StrategyId {
   return value === 'STRAT_A' || value === 'STRAT_B' || value === 'STRAT_C';
+}
+
+function resolveStrategyIdFromRunId(runId: string | undefined): StrategyId | undefined {
+  if (runId === DEFAULT_RUN_ID_BY_STRATEGY.STRAT_A) {
+    return 'STRAT_A';
+  }
+  if (runId === DEFAULT_RUN_ID_BY_STRATEGY.STRAT_B) {
+    return 'STRAT_B';
+  }
+  if (runId === DEFAULT_RUN_ID_BY_STRATEGY.STRAT_C) {
+    return 'STRAT_C';
+  }
+  return undefined;
 }
 
 function extractCandle(payload: Readonly<Record<string, unknown>>): ChartCandle | undefined {
@@ -293,6 +653,12 @@ function mergeSectionSnapshot(prev: StrategySection, next: StrategySection): Str
     ...((nextMaxSeq >= prevMaxSeq ? (next.kpi ?? prev.kpi) : (prev.kpi ?? next.kpi))
       ? { kpi: nextMaxSeq >= prevMaxSeq ? (next.kpi ?? prev.kpi) : (prev.kpi ?? next.kpi) }
       : {}),
+    ...(next.latestEntryReadiness ?? prev.latestEntryReadiness
+      ? { latestEntryReadiness: next.latestEntryReadiness ?? prev.latestEntryReadiness }
+      : {}),
+    ...(next.realtimeStatus ?? prev.realtimeStatus
+      ? { realtimeStatus: next.realtimeStatus ?? prev.realtimeStatus }
+      : {}),
     events,
     candles,
     gapCount: computeGapCount(events)
@@ -409,9 +775,9 @@ function buildStrategyOverlayLines(strategyId: StrategyId, candles: readonly Cha
   if (strategyId === 'STRAT_A') {
     const bb = bollingerSeries(candles, 20, 2);
     return [
-      { id: 'A-BB-UPPER', label: 'BB Upper', color: '#16a34a', data: bb.upper, lineStyle: LineStyle.Dashed },
-      { id: 'A-BB-MID', label: 'BB Mid', color: '#f59e0b', data: bb.mid },
-      { id: 'A-BB-LOWER', label: 'BB Lower', color: '#dc2626', data: bb.lower, lineStyle: LineStyle.Dashed }
+      { id: 'A-BB-UPPER', label: 'BB Upper', color: UI_COLOR.status.success, data: bb.upper, lineStyle: LineStyle.Dashed },
+      { id: 'A-BB-MID', label: 'BB Mid', color: UI_COLOR.status.warning, data: bb.mid },
+      { id: 'A-BB-LOWER', label: 'BB Lower', color: UI_COLOR.status.error, data: bb.lower, lineStyle: LineStyle.Dashed }
     ];
   }
 
@@ -422,7 +788,7 @@ function buildStrategyOverlayLines(strategyId: StrategyId, candles: readonly Cha
       {
         id: 'B-POI-HIGH',
         label: 'POI High',
-        color: '#f59e0b',
+        color: UI_COLOR.status.warning,
         data: rollingExtremeSeries(candles, 12, 'high', false),
         lineStyle: LineStyle.Dotted
       },
@@ -501,7 +867,7 @@ function toChartMarkers(events: readonly WsEventEnvelopeDto[]): ChartOverlayMark
           time,
           position: side === 'SELL' ? 'aboveBar' : 'belowBar',
           shape: side === 'SELL' ? 'arrowDown' : 'arrowUp',
-          color: side === 'SELL' ? '#dc2626' : '#16a34a',
+          color: side === 'SELL' ? UI_COLOR.trade.sell : UI_COLOR.trade.buy,
           text: side === 'SELL' ? 'SELL' : 'BUY'
         } as ChartOverlayMarker;
       }
@@ -512,7 +878,7 @@ function toChartMarkers(events: readonly WsEventEnvelopeDto[]): ChartOverlayMark
           time,
           position: 'inBar',
           shape: 'circle',
-          color: '#f97316',
+          color: UI_COLOR.status.warning,
           text: String(payload.reason ?? 'EXIT'),
           ...(typeof price === 'number'
             ? { price }
@@ -525,7 +891,7 @@ function toChartMarkers(events: readonly WsEventEnvelopeDto[]): ChartOverlayMark
           time,
           position: 'belowBar',
           shape: 'square',
-          color: '#2563eb',
+          color: UI_COLOR.status.info,
           text: String(payload.signal ?? 'SIGNAL')
         } as ChartOverlayMarker;
       }
@@ -534,7 +900,7 @@ function toChartMarkers(events: readonly WsEventEnvelopeDto[]): ChartOverlayMark
         time,
         position: 'aboveBar',
         shape: 'square',
-        color: '#b45309',
+        color: UI_COLOR.status.error,
         text: 'RISK'
       } as ChartOverlayMarker;
     })
@@ -563,6 +929,23 @@ function computeGapCount(events: readonly WsEventEnvelopeDto[]): number {
 
 function formatKrw(value: number): string {
   return `${Math.round(value).toLocaleString('ko-KR')} KRW`;
+}
+
+function formatPct(value: number, fractionDigits = 2): string {
+  return `${value.toLocaleString('ko-KR', {
+    minimumFractionDigits: fractionDigits,
+    maximumFractionDigits: fractionDigits
+  })}%`;
+}
+
+function formatQty(value: number): string {
+  if (!Number.isFinite(value)) {
+    return '0';
+  }
+  if (Number.isInteger(value)) {
+    return value.toLocaleString('ko-KR');
+  }
+  return value.toLocaleString('ko-KR', { maximumFractionDigits: 8 });
 }
 
 function formatDateTimeMinute(isoTime: string): string {
@@ -645,14 +1028,103 @@ function computeRealtimeKpi(events: readonly WsEventEnvelopeDto[]): RunKpi {
   };
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function normalizePct(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.round(clamp(value, 0, 100));
+}
+
+function inferInPosition(events: readonly WsEventEnvelopeDto[]): boolean {
+  const lastPositionUpdate = [...events]
+    .filter((event) => event.eventType === 'POSITION_UPDATE')
+    .sort((a, b) => b.seq - a.seq)[0];
+  if (!lastPositionUpdate) {
+    return false;
+  }
+  const payload = lastPositionUpdate.payload as Readonly<Record<string, unknown>>;
+  return String(payload.side ?? '').toUpperCase() === 'LONG';
+}
+
+function resolveEntryReadinessMeta(
+  readinessPct: number,
+  inPosition: boolean
+): Readonly<{ label: string; color: string }> {
+  if (inPosition) {
+    return { label: '보유 중', color: UI_COLOR.status.paused };
+  }
+  if (readinessPct >= 85) {
+    return { label: '진입 임박', color: UI_COLOR.status.error };
+  }
+  if (readinessPct >= 70) {
+    return { label: '주의 구간', color: UI_COLOR.status.warning };
+  }
+  return { label: '대기 구간', color: UI_COLOR.status.info };
+}
+
+type EntryReadinessSnapshot = Readonly<{
+  entryReadinessPct: number;
+  entryReady: boolean;
+  entryExecutable: boolean;
+  reason: string;
+  inPosition: boolean;
+}>;
+
+function getLatestEntryReadiness(events: readonly WsEventEnvelopeDto[]): EntryReadinessSnapshot | undefined {
+  const readinessEvent = [...events]
+    .filter((event) => event.eventType === 'ENTRY_READINESS')
+    .sort((a, b) => b.seq - a.seq)[0];
+  if (!readinessEvent) {
+    return undefined;
+  }
+  const payload = readinessEvent.payload as Readonly<Record<string, unknown>>;
+  const entryReadinessPctRaw = payload.entryReadinessPct;
+  const entryReadyRaw = payload.entryReady;
+  const entryExecutableRaw = payload.entryExecutable;
+  const reasonRaw = payload.reason;
+  const inPositionRaw = payload.inPosition;
+  return {
+    entryReadinessPct: typeof entryReadinessPctRaw === 'number' ? normalizePct(entryReadinessPctRaw) : 0,
+    entryReady: entryReadyRaw === true,
+    entryExecutable: entryExecutableRaw === true,
+    reason: typeof reasonRaw === 'string' ? reasonRaw : 'ENTRY_WAIT',
+    inPosition: inPositionRaw === true
+  };
+}
+
+function buildEntryReadinessByStrategy(
+  sections: StrategySections,
+  prev?: StrategyEntryReadinessById
+): StrategyEntryReadinessById {
+  return {
+    STRAT_A: sections.STRAT_A.latestEntryReadiness ?? getLatestEntryReadiness(sections.STRAT_A.events) ?? prev?.STRAT_A ?? EMPTY_ENTRY_READINESS_SNAPSHOT,
+    STRAT_B: sections.STRAT_B.latestEntryReadiness ?? getLatestEntryReadiness(sections.STRAT_B.events) ?? prev?.STRAT_B ?? EMPTY_ENTRY_READINESS_SNAPSHOT,
+    STRAT_C: sections.STRAT_C.latestEntryReadiness ?? getLatestEntryReadiness(sections.STRAT_C.events) ?? prev?.STRAT_C ?? EMPTY_ENTRY_READINESS_SNAPSHOT
+  };
+}
+
 function toTradeRows(events: readonly WsEventEnvelopeDto[]): TradeRow[] {
-  return events
-    .filter(isTradeFillEvent)
-    .sort((a, b) => b.seq - a.seq)
-    .slice(0, 10)
+  return [...events]
+    .sort((a, b) => {
+      const tsDiff = Date.parse(b.eventTs) - Date.parse(a.eventTs);
+      if (Number.isFinite(tsDiff) && tsDiff !== 0) {
+        return tsDiff;
+      }
+      return b.seq - a.seq;
+    })
     .map((event) => {
       const payload = event.payload as Readonly<Record<string, unknown>>;
       const side = typeof payload.side === 'string' ? payload.side : 'UNKNOWN';
+      const qty = resolveFillQty(payload);
+      const notionalRaw = typeof payload.notionalKrw === 'number' && Number.isFinite(payload.notionalKrw)
+        ? payload.notionalKrw
+        : typeof payload.fillPrice === 'number' && Number.isFinite(payload.fillPrice)
+          ? payload.fillPrice * qty
+          : undefined;
       const fillPrice = typeof payload.fillPrice === 'number'
         ? `${payload.fillPrice.toLocaleString('ko-KR')} KRW`
         : '-';
@@ -662,7 +1134,9 @@ function toTradeRows(events: readonly WsEventEnvelopeDto[]): TradeRow[] {
         eventTs: formatDateTimeMinute(event.eventTs),
         seq: event.seq,
         side,
+        qty: formatQty(qty),
         fillPrice,
+        notionalKrw: typeof notionalRaw === 'number' ? formatKrw(notionalRaw) : '-',
         traceId: event.traceId
       };
     });
@@ -672,10 +1146,13 @@ const tradeColumns: ColumnsType<TradeRow> = [
   { title: '체결 시각', dataIndex: 'eventTs', key: 'eventTs' },
   { title: 'Seq', dataIndex: 'seq', key: 'seq', width: 90 },
   { title: '사이드', dataIndex: 'side', key: 'side', width: 100 },
-  { title: '체결가', dataIndex: 'fillPrice', key: 'fillPrice', width: 160 }
+  { title: '수량', dataIndex: 'qty', key: 'qty', width: 120 },
+  { title: '체결가', dataIndex: 'fillPrice', key: 'fillPrice', width: 160 },
+  { title: '금액', dataIndex: 'notionalKrw', key: 'notionalKrw', width: 160 }
 ];
 
 export function RunsLivePage() {
+  const [messageApi, messageContextHolder] = message.useMessage();
   const {
     status,
     markLive,
@@ -683,10 +1160,16 @@ export function RunsLivePage() {
     markPaused,
     markEventReceived,
     setReconnectState,
-    setPending
+    setPending,
+    syncFromRemote
   } = useRealtimeStatus({ staleThresholdMs: MARKET_STREAM_STALE_THRESHOLD_MS });
 
   const [sections, setSections] = useState<StrategySections>(createInitialSections);
+  const [fillEventsByStrategy, setFillEventsByStrategy] = useState<StrategyFillEvents>(createInitialFillEvents);
+  const [fillPaginationByStrategy, setFillPaginationByStrategy] = useState<StrategyFillPagination>(createInitialFillPagination);
+  const [accountSummariesByStrategy, setAccountSummariesByStrategy] = useState<StrategyAccountSummaries>(createInitialAccountSummaries);
+  const [entryReadinessByStrategy, setEntryReadinessByStrategy] = useState<StrategyEntryReadinessById>(createInitialEntryReadinessById);
+  const [baseCandles, setBaseCandles] = useState<readonly ChartCandle[]>([]);
   const [sectionsLoading, setSectionsLoading] = useState(true);
   const [apiReady, setApiReady] = useState(false);
   const [apiErrorMessage, setApiErrorMessage] = useState<string | undefined>(undefined);
@@ -701,16 +1184,12 @@ export function RunsLivePage() {
   const [pendingAction, setPendingAction] = useState<string | undefined>(undefined);
 
   const lastSeqRef = useRef<Partial<Record<StrategyId, number>>>({});
+  const lastEventTsRef = useRef<Partial<Record<StrategyId, string>>>({});
+  const lastFillNoticeSeqRef = useRef<Partial<Record<StrategyId, number>>>({});
 
   const controlledSection = sections[controlStrategyId];
   const controlRunId = controlledSection.runId ?? LIVE_RUN_ID;
   const entryPolicy = mode === 'SEMI_AUTO' ? 'NEXT_OPEN_AFTER_APPROVAL' : 'AUTO';
-  const sharedCandles = useMemo(() => {
-    return STRATEGY_IDS.reduce<readonly ChartCandle[]>((best, strategyId) => {
-      const current = sections[strategyId].candles;
-      return current.length > best.length ? current : best;
-    }, []);
-  }, [sections]);
 
   const hydrateControlFromSection = useCallback((next: StrategySection | undefined) => {
     if (!next) {
@@ -734,8 +1213,45 @@ export function RunsLivePage() {
     }
   }, []);
 
+  const fetchStrategyFillPage = useCallback(async (
+    strategyId: StrategyId,
+    page: number,
+    pageSize: number
+  ) => {
+    const response = await httpGet<StrategyFillPageResponse>(
+      `/runs/strategies/${strategyId}/fills?page=${Math.max(1, Math.floor(page))}&pageSize=${Math.max(1, Math.floor(pageSize))}`
+    );
+    setFillEventsByStrategy((prev) => ({
+      ...prev,
+      [strategyId]: response.items
+    }));
+    setFillPaginationByStrategy((prev) => ({
+      ...prev,
+      [strategyId]: {
+        page: response.page,
+        pageSize: response.pageSize,
+        total: response.total
+      }
+    }));
+  }, []);
+
+  const fetchStrategyAccountSummary = useCallback(async (strategyId: StrategyId) => {
+    const response = await httpGet<StrategyAccountSummary>(`/runs/strategies/${strategyId}/account-summary`);
+    setAccountSummariesByStrategy((prev) => ({
+      ...prev,
+      [strategyId]: response
+    }));
+  }, []);
+
   const refreshSections = useCallback(async () => {
     try {
+      try {
+        const fetchedBaseCandles = await httpGet<ChartCandle[]>(`/runs/${LIVE_RUN_ID}/candles?limit=300`);
+        setBaseCandles(fetchedBaseCandles);
+      } catch {
+        setBaseCandles([]);
+      }
+
       const history = await httpGet<RunHistoryRow[]>('/runs/history');
 
     const latestByStrategy = new Map<StrategyId, RunHistoryRow>();
@@ -756,6 +1272,7 @@ export function RunsLivePage() {
           httpGet<RunDetail>(`/runs/${latest.runId}`),
           httpGet<ChartCandle[]>(`/runs/${latest.runId}/candles?limit=300`)
         ]);
+        const detailRealtimeStatus = toRealtimeStatus(detail.realtimeStatus);
 
         const section: StrategySection = {
           strategyId,
@@ -768,6 +1285,8 @@ export function RunsLivePage() {
           entryPolicy: detail.entryPolicy,
           runConfig: detail.runConfig,
           kpi: detail.kpi,
+          ...(detail.latestEntryReadiness ? { latestEntryReadiness: detail.latestEntryReadiness } : {}),
+          ...(detailRealtimeStatus ? { realtimeStatus: detailRealtimeStatus } : {}),
           events: detail.events,
           candles,
           gapCount: computeGapCount(detail.events)
@@ -780,8 +1299,18 @@ export function RunsLivePage() {
     const nextSections = builtEntries.reduce<Record<StrategyId, StrategySection>>((acc, [strategyId, section]) => {
       acc[strategyId] = section;
       const maxSeq = section.events.reduce((max, event) => Math.max(max, event.seq), 0);
+      const latestEvent = [...section.events].sort((a, b) => {
+        const tsDiff = Date.parse(b.eventTs) - Date.parse(a.eventTs);
+        if (Number.isFinite(tsDiff) && tsDiff !== 0) {
+          return tsDiff;
+        }
+        return b.seq - a.seq;
+      })[0];
       if (maxSeq > 0) {
         lastSeqRef.current[strategyId] = maxSeq;
+      }
+      if (latestEvent?.eventTs) {
+        lastEventTsRef.current[strategyId] = latestEvent.eventTs;
       }
       return acc;
     }, {
@@ -789,39 +1318,14 @@ export function RunsLivePage() {
       STRAT_B: createEmptySection('STRAT_B'),
       STRAT_C: createEmptySection('STRAT_C')
     });
-
-    let fallbackCandles = STRATEGY_IDS
-      .map((strategyId) => nextSections[strategyId].candles)
-      .find((candles) => candles.length > 0);
-
-    if (!fallbackCandles || fallbackCandles.length === 0) {
-      try {
-        const fetched = await httpGet<ChartCandle[]>(`/runs/${LIVE_RUN_ID}/candles?limit=300`);
-        if (fetched.length > 0) {
-          fallbackCandles = fetched;
-        }
-      } catch {
-        // fallback ?????????곗뒭?????????怨뚯댅 ?????轅붽틓?蹂잛젂?④낮釉??????釉먮빱????????癲ル슢????
-      }
-    }
-
-    if (fallbackCandles && fallbackCandles.length > 0) {
-      STRATEGY_IDS.forEach((strategyId) => {
-        const section = nextSections[strategyId];
-        if (section.candles.length === 0) {
-          nextSections[strategyId] = {
-            ...section,
-            candles: fallbackCandles
-          };
-        }
-      });
-    }
-
+      setEntryReadinessByStrategy((prev) => buildEntryReadinessByStrategy(nextSections, prev));
       let mergedSections = nextSections;
       setSections((prev) => {
         mergedSections = mergeStrategySections(prev, nextSections);
         return mergedSections;
       });
+      await Promise.all(STRATEGY_IDS.map((strategyId) => fetchStrategyAccountSummary(strategyId)));
+
       setApiReady(true);
       setApiErrorMessage(undefined);
       hydrateControlFromSection(mergedSections[controlStrategyId]);
@@ -833,7 +1337,7 @@ export function RunsLivePage() {
       setApiErrorMessage(error instanceof Error ? error.message : 'API request failed');
       markError();
     }
-  }, [controlStrategyId, hydrateControlFromSection, markError]);
+  }, [controlStrategyId, fetchStrategyAccountSummary, hydrateControlFromSection, markError]);
 
   useEffect(() => {
     let mounted = true;
@@ -841,6 +1345,9 @@ export function RunsLivePage() {
     const load = async () => {
       try {
         await refreshSections();
+        await Promise.all(
+          STRATEGY_IDS.map((strategyId) => fetchStrategyFillPage(strategyId, 1, 50))
+        );
       } finally {
         if (mounted) {
           setSectionsLoading(false);
@@ -853,7 +1360,7 @@ export function RunsLivePage() {
     return () => {
       mounted = false;
     };
-  }, [refreshSections]);
+  }, [fetchStrategyFillPage, refreshSections]);
 
   useEffect(() => {
     if (sectionsLoading || !apiReady) {
@@ -873,6 +1380,10 @@ export function RunsLivePage() {
     hydrateControlFromSection(sections[controlStrategyId]);
   }, [controlStrategyId, hydrateControlFromSection, sections]);
 
+  useEffect(() => {
+    syncFromRemote(sections[controlStrategyId].realtimeStatus);
+  }, [controlStrategyId, sections, syncFromRemote]);
+
   const syncRunControl = useCallback(async () => {
     if (!apiReady) {
       return;
@@ -889,7 +1400,7 @@ export function RunsLivePage() {
         entryPolicy
       });
     } catch (error) {
-      // ??癲??????????틯???????怨뚯댅 ?????濚밸Ŧ援??????용츧???⑤８???????????ㅻ쿋?????????틯????????
+      // Best-effort control sync. Keep the live workspace usable if this request fails.
     }
   }, [
     apiReady,
@@ -925,19 +1436,119 @@ export function RunsLivePage() {
       onEvent: (event: WsEventEnvelopeDto) => {
         const payload = event.payload as Readonly<Record<string, unknown>>;
         const payloadStrategy = payload.strategyId;
+        const payloadRunStrategy = resolveStrategyIdFromRunId(event.runId);
         const hasExplicitStrategy = isStrategyId(payloadStrategy);
-        const strategyId = hasExplicitStrategy ? payloadStrategy : controlStrategyId;
+        const strategyId = hasExplicitStrategy
+          ? payloadStrategy
+          : (payloadRunStrategy ?? controlStrategyId);
         const nextCandle = extractCandle(payload);
+        const latestEntryReadiness = event.eventType === 'ENTRY_READINESS'
+          ? getLatestEntryReadiness([event])
+          : undefined;
 
         const prevSeq = lastSeqRef.current[strategyId];
+        const prevEventTs = lastEventTsRef.current[strategyId];
         if (typeof prevSeq === 'number' && event.seq <= prevSeq) {
+          const eventTsMs = Date.parse(event.eventTs);
+          const prevEventTsMs = typeof prevEventTs === 'string' ? Date.parse(prevEventTs) : Number.NaN;
+          if (
+            event.seq < prevSeq &&
+            Number.isFinite(eventTsMs) &&
+            Number.isFinite(prevEventTsMs) &&
+            eventTsMs > prevEventTsMs
+          ) {
+            lastSeqRef.current[strategyId] = event.seq;
+            lastEventTsRef.current[strategyId] = event.eventTs;
+            void refreshSections();
+          }
           return;
         }
 
         lastSeqRef.current[strategyId] = event.seq;
+        lastEventTsRef.current[strategyId] = event.eventTs;
+
+        if (strategyId === controlStrategyId) {
+          markEventReceived();
+        }
+
+        if (event.eventType === 'FILL') {
+          const sideRaw = payload.side;
+          const fillPriceRaw = payload.fillPrice;
+          if (typeof sideRaw === 'string' && typeof fillPriceRaw === 'number' && Number.isFinite(fillPriceRaw)) {
+            const normalizedSide = sideRaw.toUpperCase();
+            const qtyRaw = payload.qty;
+            const quantityRaw = payload.quantity;
+            const fillQty = typeof qtyRaw === 'number' && Number.isFinite(qtyRaw) && qtyRaw > 0
+              ? qtyRaw
+              : typeof quantityRaw === 'number' && Number.isFinite(quantityRaw) && quantityRaw > 0
+                ? quantityRaw
+                : 1;
+            const notionalRaw = typeof payload.notionalKrw === 'number' && Number.isFinite(payload.notionalKrw)
+              ? payload.notionalKrw
+              : fillPriceRaw * fillQty;
+            const sideLabel = normalizedSide === 'SELL' ? '매도' : '매수';
+            const lastNotifiedSeq = lastFillNoticeSeqRef.current[strategyId] ?? 0;
+            if (event.seq > lastNotifiedSeq) {
+              lastFillNoticeSeqRef.current[strategyId] = event.seq;
+              messageApi.open({
+                type: normalizedSide === 'SELL' ? 'error' : 'success',
+                content: `${strategyId} | ${sideLabel} | ${formatKrw(fillPriceRaw)} | 수량 ${formatQty(fillQty)} | 금액 ${formatKrw(notionalRaw)}`,
+                duration: 2.2
+              });
+            }
+          }
+
+          setFillEventsByStrategy((prev) => {
+            const current = prev[strategyId] ?? [];
+            const deduped = current.filter((item) => !(item.seq === event.seq && item.runId === event.runId));
+            const merged = [event, ...deduped]
+              .sort((a, b) => {
+                const tsDiff = Date.parse(b.eventTs) - Date.parse(a.eventTs);
+                if (Number.isFinite(tsDiff) && tsDiff !== 0) {
+                  return tsDiff;
+                }
+                return b.seq - a.seq;
+              });
+            const pageSize = fillPaginationByStrategy[strategyId]?.pageSize ?? 50;
+            return {
+              ...prev,
+              [strategyId]: merged.slice(0, pageSize)
+            };
+          });
+          setFillPaginationByStrategy((prev) => ({
+            ...prev,
+            [strategyId]: {
+              ...prev[strategyId],
+              total: (prev[strategyId]?.total ?? 0) + 1
+            }
+          }));
+          setAccountSummariesByStrategy((prev) => ({
+            ...prev,
+            [strategyId]: applyFillToAccountSummary(strategyId, prev[strategyId], event)
+          }));
+        }
+
+        if (latestEntryReadiness) {
+          setEntryReadinessByStrategy((prev) => ({
+            ...prev,
+            [strategyId]: latestEntryReadiness
+          }));
+        }
 
         if (nextCandle) {
-          markEventReceived();
+          setBaseCandles((prev) => upsertCandle(prev, nextCandle));
+          setAccountSummariesByStrategy((prev) => {
+            const targetStrategyIds = hasExplicitStrategy ? [strategyId] : STRATEGY_IDS;
+            const nextSummaries = { ...prev };
+            targetStrategyIds.forEach((targetStrategyId) => {
+              nextSummaries[targetStrategyId] = applyMarkPriceToAccountSummary(
+                targetStrategyId,
+                prev[targetStrategyId],
+                nextCandle.close
+              );
+            });
+            return nextSummaries;
+          });
         }
 
         setSections((prev) => {
@@ -956,6 +1567,8 @@ export function RunsLivePage() {
             runId: event.runId,
             ...(nextStrategyVersion ? { strategyVersion: nextStrategyVersion } : {}),
             ...(nextMarket ? { market: nextMarket } : {}),
+            ...(latestEntryReadiness ? { latestEntryReadiness } : {}),
+            realtimeStatus: touchRealtimeStatus(current.realtimeStatus, event.eventTs),
             events,
             gapCount: computeGapCount(events)
           };
@@ -985,7 +1598,7 @@ export function RunsLivePage() {
         });
       }
     }),
-    [controlStrategyId, markError, markEventReceived, markLive, markPaused, setReconnectState]
+    [controlStrategyId, fillPaginationByStrategy, markError, markEventReceived, markLive, markPaused, messageApi, refreshSections, setReconnectState]
   );
 
   const socketOptions = useMemo(
@@ -1030,8 +1643,169 @@ export function RunsLivePage() {
     }, 700);
   }
 
+  const strategySummaryRows: StrategySummaryRow[] = STRATEGY_IDS.map((strategyId) => {
+    const section = sections[strategyId];
+    const accountSummary = accountSummariesByStrategy[strategyId];
+    const fillPagination = fillPaginationByStrategy[strategyId];
+    const liveKpi = computeRealtimeKpi(section.events);
+    const hasAnyFill = (fillPagination.total ?? 0) > 0 ||
+      (accountSummary?.fillCount ?? 0) > 0 ||
+      liveKpi.trades > 0;
+    const hasRealtimeTradeData = hasAnyFill && (liveKpi.trades > 0 || liveKpi.exits > 0);
+    const kpi = hasAnyFill
+      ? (hasRealtimeTradeData ? liveKpi : (section.kpi ?? liveKpi))
+      : ZERO_KPI;
+    const seedCapitalKrw = accountSummary?.seedCapitalKrw ?? DEFAULT_SEED_CAPITAL_KRW;
+    const todayPnlPct = computeTodayPnlPct(section.events);
+    const todayPnlAmount = hasAnyFill ? seedCapitalKrw * (todayPnlPct / 100) : 0;
+    const latestEntryReadiness = entryReadinessByStrategy[strategyId] ?? EMPTY_ENTRY_READINESS_SNAPSHOT;
+    const inPosition = latestEntryReadiness.inPosition ?? inferInPosition(section.events);
+    const entryReadinessPct = normalizePct(
+      latestEntryReadiness
+        ? latestEntryReadiness.entryReadinessPct
+        : (inPosition ? 100 : 0)
+    );
+    const entryReadinessMeta = resolveEntryReadinessMeta(entryReadinessPct, inPosition);
+
+    return {
+      key: strategyId,
+      strategyId,
+      strategyLabel: strategyId.replace('STRAT_', ''),
+      ...(section.runId ? { runId: section.runId } : {}),
+      totalPnlKrw: accountSummary?.totalPnlKrw ?? 0,
+      totalPnlPct: accountSummary?.totalPnlPct ?? 0,
+      positionQty: accountSummary?.positionQty ?? 0,
+      avgEntryPriceKrw: accountSummary?.avgEntryPriceKrw ?? 0,
+      avgWinPct: kpi.avgWinPct ?? 0,
+      avgLossPct: kpi.avgLossPct ?? 0,
+      todayPnlAmount,
+      mddPct: kpi.mddPct ?? 0,
+      entryReadinessPct,
+      entryReadinessColor: entryReadinessMeta.color,
+      winRate: kpi.winRate ?? 0,
+      sumReturnPct: kpi.sumReturnPct ?? 0
+    };
+  });
+
+  const strategySummaryColumns: ColumnsType<StrategySummaryRow> = [
+    {
+      title: '전략 유형',
+      dataIndex: 'strategyLabel',
+      key: 'strategyLabel',
+      width: 110,
+      render: (_value, record) => (
+        <Space direction="vertical" size={0}>
+          <Tag color={record.strategyId === controlStrategyId ? 'blue' : 'default'}>
+            {record.strategyLabel}
+          </Tag>
+          <Text type="secondary">{record.runId ?? '-'}</Text>
+        </Space>
+      )
+    },
+    {
+      title: '총 손익 / 총 수익률',
+      key: 'totalPnl',
+      width: 180,
+      render: (_value, record) => (
+        <Space direction="vertical" size={0}>
+          <Text strong style={{ color: getSignedMetricColor(record.totalPnlKrw) }}>
+            {formatKrw(record.totalPnlKrw)}
+          </Text>
+          <Text style={{ color: getSignedMetricColor(record.totalPnlPct) }}>
+            {formatPct(record.totalPnlPct, 4)}
+          </Text>
+        </Space>
+      )
+    },
+    {
+      title: '보유 수량',
+      dataIndex: 'positionQty',
+      key: 'positionQty',
+      width: 120,
+      render: (value: number) => formatQty(value)
+    },
+    {
+      title: '평균 매입가',
+      dataIndex: 'avgEntryPriceKrw',
+      key: 'avgEntryPriceKrw',
+      width: 150,
+      render: (value: number) => formatKrw(value)
+    },
+    {
+      title: '평균 수익률 (+/-)',
+      key: 'avgReturn',
+      width: 150,
+      render: (_value, record) => (
+        <Space direction="vertical" size={0}>
+          <Text style={{ color: UI_COLOR.kpi.positive }}>
+            {`${record.avgWinPct > 0 ? '+' : ''}${formatPct(record.avgWinPct, 4)}`}
+          </Text>
+          <Text style={{ color: UI_COLOR.kpi.negative }}>
+            {formatPct(record.avgLossPct, 4)}
+          </Text>
+        </Space>
+      )
+    },
+    {
+      title: '당일 누적 손익 금액',
+      dataIndex: 'todayPnlAmount',
+      key: 'todayPnlAmount',
+      width: 160,
+      render: (value: number) => (
+        <Text style={{ color: getSignedMetricColor(value) }}>
+          {formatKrw(value)}
+        </Text>
+      )
+    },
+    {
+      title: 'MDD',
+      dataIndex: 'mddPct',
+      key: 'mddPct',
+      width: 110,
+      render: (value: number) => (
+        <Text style={{ color: UI_COLOR.kpi.mdd, fontWeight: 700 }}>
+          {formatPct(value, 4)}
+        </Text>
+      )
+    },
+    {
+      title: '진입률',
+      dataIndex: 'entryReadinessPct',
+      key: 'entryReadinessPct',
+      width: 110,
+      render: (value: number, record) => (
+        <Text style={{ color: record.entryReadinessColor, fontWeight: 600 }}>
+          {formatPct(value, 0)}
+        </Text>
+      )
+    },
+    {
+      title: '승률 / 누적 수익률',
+      key: 'winRate',
+      width: 150,
+      render: (_value, record) => (
+        <Space direction="vertical" size={0}>
+          <Text>{formatPct(record.winRate, 2)}</Text>
+          <Text style={{ color: getSignedMetricColor(record.sumReturnPct) }}>
+            {formatPct(record.sumReturnPct, 4)}
+          </Text>
+        </Space>
+      )
+    }
+  ];
+
+  const selectedTradeRows = toTradeRows(fillEventsByStrategy[controlStrategyId]);
+  const selectedFillPagination = fillPaginationByStrategy[controlStrategyId];
+  const selectedDisplayCandles = baseCandles.length > 0 ? baseCandles : controlledSection.candles;
+  const isUsingSharedCandles = baseCandles.length > 0;
+  const selectedChartOverlays = buildStrategyOverlayLines(controlStrategyId, selectedDisplayCandles);
+  const selectedChartMarkers = toChartMarkers(controlledSection.events);
+  const selectedChartTheme = STRATEGY_CHART_THEME[controlStrategyId];
+  const selectedDisplayedStatus = resolveDisplayRealtimeStatus(controlledSection.realtimeStatus, status, true);
+
   return (
     <Flex vertical gap={16} style={{ background: '#f3f6fa', padding: 16 }}>
+      {messageContextHolder}
       {apiErrorMessage ? (
         <Alert
           type="warning"
@@ -1050,300 +1824,221 @@ export function RunsLivePage() {
         <Alert type="info" showIcon title="전략 섹션 데이터를 불러오는 중입니다." />
       ) : null}
 
-      {STRATEGY_IDS.map((strategyId) => {
-        const section = sections[strategyId];
-        const isControlTarget = controlStrategyId === strategyId;
-        const liveKpi = computeRealtimeKpi(section.events);
-        const hasRealtimeTradeData = liveKpi.trades > 0 || liveKpi.exits > 0;
-        const kpi = hasRealtimeTradeData ? liveKpi : (section.kpi ?? liveKpi);
-        const riskSnapshot = section.runConfig?.riskSnapshot;
-        const riskBlockCount = section.events.filter((event) => event.eventType === 'RISK_BLOCK' || event.eventType === 'LIVE_GUARD_BLOCKED').length;
-        const pauseCount = section.events.filter((event) => event.eventType === 'PAUSE').length;
-        const todayPnlPct = computeTodayPnlPct(section.events);
-        const todayPnlAmount = DEFAULT_SEED_CAPITAL_KRW * (todayPnlPct / 100);
-        const tradeRows = toTradeRows(section.events);
-        const displayCandles = section.candles.length > 0 ? section.candles : sharedCandles;
-        const isUsingSharedCandles = section.candles.length === 0 && displayCandles.length > 0;
-        const chartOverlays = buildStrategyOverlayLines(strategyId, displayCandles);
-        const chartMarkers = toChartMarkers(section.events);
-        const chartTheme = STRATEGY_CHART_THEME[strategyId];
-        const modeValue = isControlTarget ? mode : section.mode ?? mode;
-        const marketValue = isControlTarget ? market : section.market ?? market;
-        const fillModelRequestedValue = isControlTarget
-          ? fillModelRequested
-          : section.fillModelRequested ?? fillModelRequested;
-        const fillModelAppliedValue = isControlTarget
-          ? fillModelApplied
-          : section.fillModelApplied ?? fillModelApplied;
-        const strategyVersionValue = isControlTarget
-          ? strategyVersion
-          : section.strategyVersion ?? strategyVersion;
-
-        return (
-          <Card
-            key={strategyId}
-            title={<Text strong>{strategyId} 전략 섹션</Text>}
-            extra={(
-              <Space>
-                <Tag color={controlStrategyId === strategyId ? 'blue' : 'default'}>
-                  {controlStrategyId === strategyId ? '현재 제어 대상' : '보기'}
-                </Tag>
-                <Text type="secondary">runId: {section.runId ?? '-'}</Text>
-              </Space>
+      <Card
+        title={<Text strong>{`${controlStrategyId} 통합 실행 뷰`}</Text>}
+        extra={(
+          <Space>
+            <Tag color="blue">선택 전략</Tag>
+            <Text type="secondary">runId: {controlledSection.runId ?? '-'}</Text>
+          </Space>
+        )}
+      >
+        <Row gutter={[14, 14]}>
+          <Col xs={24} lg={14}>
+            <Text strong style={{ display: 'block', marginBottom: 8 }}>차트</Text>
+            <Space wrap size={[6, 6]} style={{ marginBottom: 8 }}>
+              <Tag color="processing">{selectedChartTheme.title}</Tag>
+              {selectedChartTheme.overlays.map((overlayLabel) => (
+                <Tag key={`${controlStrategyId}-${overlayLabel}`}>{overlayLabel}</Tag>
+              ))}
+            </Space>
+            <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
+              {selectedChartTheme.description}
+            </Text>
+            <Alert
+              style={{ marginBottom: 10 }}
+              type="info"
+              showIcon
+              title={selectedDisplayCandles.length === 0
+                ? '업비트 차트 데이터가 없습니다.'
+                : isUsingSharedCandles
+                  ? '업비트 실시간 공용 마켓 스트림을 표시 중입니다.'
+                  : '업비트 실시간 마켓 스트림을 표시 중입니다.'}
+            />
+            {selectedDisplayCandles.length > 0 ? (
+              <ChartPanel
+                candles={selectedDisplayCandles}
+                overlays={selectedChartOverlays}
+                markers={selectedChartMarkers}
+              />
+            ) : (
+              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="캔들 데이터 없음" />
             )}
-          >
-            <Row gutter={[14, 14]}>
-              <Col xs={24} lg={16}>
-                <Text strong style={{ display: 'block', marginBottom: 8 }}>차트</Text>
-                <Space wrap size={[6, 6]} style={{ marginBottom: 8 }}>
-                  <Tag color="processing">{chartTheme.title}</Tag>
-                  {chartTheme.overlays.map((overlayLabel) => (
-                    <Tag key={`${strategyId}-${overlayLabel}`}>{overlayLabel}</Tag>
-                  ))}
-                </Space>
-                <Text type="secondary" style={{ display: 'block', marginBottom: 8 }}>
-                  {chartTheme.description}
-                </Text>
-                <Alert
-                  style={{ marginBottom: 10 }}
-                  type="info"
-                  showIcon
-                  title={displayCandles.length === 0
-                    ? '업비트 차트 데이터가 없습니다.'
-                    : isUsingSharedCandles
-                      ? '업비트 실시간 공용 마켓 스트림을 표시 중입니다.'
-                      : '업비트 실시간 마켓 스트림을 표시 중입니다.'}
-                />
-                {displayCandles.length > 0 ? (
-                  <ChartPanel
-                    candles={displayCandles}
-                    overlays={chartOverlays}
-                    markers={chartMarkers}
-                  />
-                ) : (
-                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="캔들 데이터 없음" />
-                )}
-              </Col>
+          </Col>
 
-              <Col xs={24} lg={8}>
-                <Text strong style={{ display: 'block', marginBottom: 8 }}>핵심 지표 / 리스크 모니터</Text>
+          <Col xs={24} lg={10}>
+            <Flex justify="space-between" align="center" style={{ marginBottom: 8 }}>
+              <Text strong style={{ display: 'block' }}>전략 비교 테이블</Text>
+              <Text type="secondary">행 클릭 시 차트와 제어 대상이 바뀝니다.</Text>
+            </Flex>
+            <Table<StrategySummaryRow>
+              rowKey="key"
+              columns={strategySummaryColumns}
+              dataSource={strategySummaryRows}
+              size="small"
+              pagination={false}
+              scroll={{ x: 1180, y: 360 }}
+              onRow={(record) => ({
+                onClick: () => {
+                  setControlStrategyId(record.strategyId);
+                },
+                style: {
+                  cursor: 'pointer',
+                  background: record.strategyId === controlStrategyId ? '#eff6ff' : undefined
+                }
+              })}
+              locale={{ emptyText: '전략 요약 데이터가 없습니다.' }}
+            />
+          </Col>
+          <Col xs={24} lg={8}>
+            <Flex justify="space-between" align="center" style={{ marginBottom: 10 }}>
+              <Text strong>실행 제어</Text>
+              <RealtimeStatusBadge status={selectedDisplayedStatus} />
+            </Flex>
+
+            <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+              <Text type="secondary">{`제어 runId: ${controlRunId}`}</Text>
+              {typeof selectedDisplayedStatus.queueDepth === 'number' && selectedDisplayedStatus.queueDepth > 0 ? (
+                <Text type="warning">
+                  {`영속화 대기 ${selectedDisplayedStatus.queueDepth}건 | 재시도 ${selectedDisplayedStatus.retryCount}회`}
+                </Text>
+              ) : null}
+              <>
                 <Row gutter={[12, 12]}>
-                  <Col span={12}>
-                    <Statistic
-                      title="평균 수익률"
-                      value={kpi?.avgWinPct ?? 0}
-                      precision={4}
-                      suffix="%"
-                      styles={{ content: { color: '#16a34a' } }}
+                  <Col xs={24} md={12} lg={24}>
+                    <Text type="secondary">모드</Text>
+                    <Select
+                      value={mode}
+                      onChange={(value) => {
+                        setMode(value as RunMode);
+                      }}
+                      style={{ width: '100%' }}
+                      options={[
+                        { value: 'PAPER', label: 'PAPER (모의)' },
+                        { value: 'SEMI_AUTO', label: 'SEMI_AUTO (반자동)' },
+                        { value: 'AUTO', label: 'AUTO (자동)' },
+                        { value: 'LIVE', label: 'LIVE (실거래)' }
+                      ]}
                     />
                   </Col>
-                  <Col span={12}>
-                    <Statistic
-                      title="평균 손실률"
-                      value={kpi?.avgLossPct ?? 0}
-                      precision={4}
-                      suffix="%"
-                      styles={{ content: { color: '#dc2626' } }}
+                  <Col xs={24} md={12} lg={24}>
+                    <Text type="secondary">마켓</Text>
+                    <Select
+                      value={market}
+                      onChange={(value) => {
+                        setMarket(value);
+                      }}
+                      style={{ width: '100%' }}
+                      options={[
+                        { value: 'KRW-XRP', label: 'KRW-XRP' },
+                        { value: 'KRW-BTC', label: 'KRW-BTC' },
+                        { value: 'KRW-ETH', label: 'KRW-ETH' }
+                      ]}
                     />
                   </Col>
-                  <Col span={12}>
-                    <Statistic
-                      title="당일 누적 손익 금액"
-                      value={todayPnlAmount}
-                      formatter={(value) => formatKrw(Number(value ?? 0))}
-                      styles={{ content: { color: todayPnlAmount >= 0 ? '#16a34a' : '#dc2626' } }}
+                  <Col xs={24} md={12} lg={24}>
+                    <Text type="secondary">요청 체결 모델</Text>
+                    <Select
+                      value={fillModelRequested}
+                      onChange={(value) => {
+                        setFillModelRequested(value as FillModelRequested);
+                      }}
+                      style={{ width: '100%' }}
+                      options={[
+                        { value: 'AUTO', label: 'AUTO' },
+                        { value: 'NEXT_OPEN', label: 'NEXT_OPEN' },
+                        { value: 'ON_CLOSE', label: 'ON_CLOSE' }
+                      ]}
                     />
                   </Col>
-                  <Col span={12}>
-                    <Statistic
-                      title="MDD"
-                      value={kpi?.mddPct ?? 0}
-                      precision={4}
-                      suffix="%"
-                      styles={{ content: { color: '#b91c1c', fontWeight: 700 } }}
+                  <Col xs={24} md={12} lg={24}>
+                    <Text type="secondary">적용 체결 모델</Text>
+                    <Select
+                      value={fillModelApplied}
+                      onChange={(value) => {
+                        setFillModelApplied(value as FillModelApplied);
+                      }}
+                      style={{ width: '100%' }}
+                      options={[
+                        { value: 'NEXT_OPEN', label: 'NEXT_OPEN' },
+                        { value: 'ON_CLOSE', label: 'ON_CLOSE' }
+                      ]}
                     />
                   </Col>
-                  <Col span={12}>
-                    <Statistic title="리스크 차단" value={riskBlockCount} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="일시정지" value={pauseCount} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="시퀀스 누락" value={section.gapCount} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="연속 손실 제한" value={riskSnapshot?.maxConsecutiveLosses ?? 0} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="일일 손실 한도" value={riskSnapshot?.dailyLossLimitPct ?? 0} suffix="%" precision={2} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="일일 최대 주문" value={riskSnapshot?.maxDailyOrders ?? 0} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="킬스위치" value={riskSnapshot?.killSwitch ? '활성' : '비활성'} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="승률" value={kpi?.winRate ?? 0} suffix="%" precision={2} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="누적 수익률" value={kpi?.sumReturnPct ?? 0} suffix="%" precision={4} />
-                  </Col>
-                  <Col span={12}>
-                    <Statistic title="Profit Factor" value={kpi ? (kpi.profitFactor >= 9999 ? '무한대' : kpi.profitFactor.toFixed(4)) : '-'} />
+                  <Col xs={24} md={12} lg={24}>
+                    <Text type="secondary">전략 버전</Text>
+                    <Select
+                      value={strategyVersion}
+                      onChange={(value) => {
+                        setStrategyVersion(value);
+                      }}
+                      style={{ width: '100%' }}
+                      options={[{ value: strategyVersion, label: strategyVersion }]}
+                    />
                   </Col>
                 </Row>
-              </Col>
-              <Col xs={24} lg={8}>
-                <Flex justify="space-between" align="center" style={{ marginBottom: 10 }}>
-                  <Text strong>실행 제어</Text>
-                  <RealtimeStatusBadge status={status} />
-                </Flex>
 
-                <Space orientation="vertical" size={10} style={{ width: '100%' }}>
-                  <Text type="secondary">
-                    {'제어 runId: ' + (isControlTarget ? controlRunId : (section.runId ?? '-'))}
-                  </Text>
-                  <>
-                    <Row gutter={[12, 12]}>
-                      <Col xs={24} md={12} lg={24}>
-                        <Text type="secondary">모드</Text>
-                        <Select
-                          value={modeValue}
-                          onChange={(value) => {
-                            setControlStrategyId(strategyId);
-                            setMode(value as RunMode);
-                          }}
-                          style={{ width: '100%' }}
-                          options={[
-                            { value: 'PAPER', label: 'PAPER (모의)' },
-                            { value: 'SEMI_AUTO', label: 'SEMI_AUTO (반자동)' },
-                            { value: 'AUTO', label: 'AUTO (자동)' },
-                            { value: 'LIVE', label: 'LIVE (실거래)' }
-                          ]}
-                        />
-                      </Col>
-                      <Col xs={24} md={12} lg={24}>
-                        <Text type="secondary">마켓</Text>
-                        <Select
-                          value={marketValue}
-                          onChange={(value) => {
-                            setControlStrategyId(strategyId);
-                            setMarket(value);
-                          }}
-                          style={{ width: '100%' }}
-                          options={[
-                            { value: 'KRW-XRP', label: 'KRW-XRP' },
-                            { value: 'KRW-BTC', label: 'KRW-BTC' },
-                            { value: 'KRW-ETH', label: 'KRW-ETH' }
-                          ]}
-                        />
-                      </Col>
-                      <Col xs={24} md={12} lg={24}>
-                        <Text type="secondary">요청 체결 모델</Text>
-                        <Select
-                          value={fillModelRequestedValue}
-                          onChange={(value) => {
-                            setControlStrategyId(strategyId);
-                            setFillModelRequested(value as FillModelRequested);
-                          }}
-                          style={{ width: '100%' }}
-                          options={[
-                            { value: 'AUTO', label: 'AUTO' },
-                            { value: 'NEXT_OPEN', label: 'NEXT_OPEN' },
-                            { value: 'ON_CLOSE', label: 'ON_CLOSE' }
-                          ]}
-                        />
-                      </Col>
-                      <Col xs={24} md={12} lg={24}>
-                        <Text type="secondary">적용 체결 모델</Text>
-                        <Select
-                          value={fillModelAppliedValue}
-                          onChange={(value) => {
-                            setControlStrategyId(strategyId);
-                            setFillModelApplied(value as FillModelApplied);
-                          }}
-                          style={{ width: '100%' }}
-                          options={[
-                            { value: 'NEXT_OPEN', label: 'NEXT_OPEN' },
-                            { value: 'ON_CLOSE', label: 'ON_CLOSE' }
-                          ]}
-                        />
-                      </Col>
-                      <Col xs={24} md={12} lg={24}>
-                        <Text type="secondary">전략 버전</Text>
-                        <Select
-                          value={strategyVersionValue}
-                          onChange={(value) => {
-                            setControlStrategyId(strategyId);
-                            setStrategyVersion(value);
-                          }}
-                          style={{ width: '100%' }}
-                          options={[{ value: strategyVersionValue, label: strategyVersionValue }]}
-                        />
-                      </Col>
-                    </Row>
-
-                    <Flex wrap gap={8}>
-                      <Button type="primary" loading={pendingAction === 'Start'} disabled={Boolean(pendingAction) || isRunning} onClick={() => {
-                        setControlStrategyId(strategyId);
-                        triggerAction('Start', () => setIsRunning(true));
-                      }}>
-                        실행 시작
-                      </Button>
-                      <Button loading={pendingAction === 'Pause'} disabled={Boolean(pendingAction) || !isRunning} onClick={() => {
-                        setControlStrategyId(strategyId);
-                        triggerAction('Pause', markPaused);
-                      }}>
-                        일시정지
-                      </Button>
-                      <Button loading={pendingAction === 'Resume'} disabled={Boolean(pendingAction) || !isRunning} onClick={() => {
-                        setControlStrategyId(strategyId);
-                        triggerAction('Resume', markLive);
-                      }}>
-                        재개
-                      </Button>
-                      <Button loading={pendingAction === 'Stop'} disabled={Boolean(pendingAction) || !isRunning} onClick={() => {
-                        setControlStrategyId(strategyId);
-                        triggerAction('Stop', () => setIsRunning(false));
-                      }}>
-                        종료
-                      </Button>
-                      <Button loading={pendingAction === 'Approve'} disabled={Boolean(pendingAction)} onClick={() => {
-                        setControlStrategyId(strategyId);
-                        triggerAction('Approve');
-                      }}>
-                        승인
-                      </Button>
-                      <Button danger loading={pendingAction === 'KillSwitch'} disabled={Boolean(pendingAction)} onClick={() => {
-                        setControlStrategyId(strategyId);
-                        triggerAction('KillSwitch', markError);
-                      }}>
-                        긴급중지
-                      </Button>
-                    </Flex>
-                  </>
-                </Space>
-              </Col>
-              <Col xs={24} lg={16}>
-                <Flex justify="space-between" align="center" style={{ marginBottom: 8 }}>
-                  <Text strong>최근 체결 내역 (최신순)</Text>
-                  <Text type="secondary">{tradeRows.length}건</Text>
+                <Flex wrap gap={8}>
+                  <Button type="primary" loading={pendingAction === 'Start'} disabled={Boolean(pendingAction) || isRunning} onClick={() => {
+                    triggerAction('Start', () => setIsRunning(true));
+                  }}>
+                    실행 시작
+                  </Button>
+                  <Button loading={pendingAction === 'Pause'} disabled={Boolean(pendingAction) || !isRunning} onClick={() => {
+                    triggerAction('Pause', markPaused);
+                  }}>
+                    일시정지
+                  </Button>
+                  <Button loading={pendingAction === 'Resume'} disabled={Boolean(pendingAction) || !isRunning} onClick={() => {
+                    triggerAction('Resume', markLive);
+                  }}>
+                    재개
+                  </Button>
+                  <Button loading={pendingAction === 'Stop'} disabled={Boolean(pendingAction) || !isRunning} onClick={() => {
+                    triggerAction('Stop', () => setIsRunning(false));
+                  }}>
+                    종료
+                  </Button>
+                  <Button loading={pendingAction === 'Approve'} disabled={Boolean(pendingAction)} onClick={() => {
+                    triggerAction('Approve');
+                  }}>
+                    승인
+                  </Button>
+                  <Button danger loading={pendingAction === 'KillSwitch'} disabled={Boolean(pendingAction)} onClick={() => {
+                    triggerAction('KillSwitch', markError);
+                  }}>
+                    긴급중지
+                  </Button>
                 </Flex>
-                <Table<TradeRow>
-                  rowKey="key"
-                  columns={tradeColumns}
-                  dataSource={tradeRows}
-                  size="small"
-                  pagination={false}
-                  locale={{ emptyText: '체결 내역이 없습니다.' }}
-                />
-              </Col>
-            </Row>
-          </Card>
-        );
-      })}
+              </>
+            </Space>
+          </Col>
+          <Col xs={24} lg={16}>
+            <Flex justify="space-between" align="center" style={{ marginBottom: 8 }}>
+              <Text strong>최근 체결 내역 (최신순)</Text>
+              <Text type="secondary">{selectedFillPagination.total}건</Text>
+            </Flex>
+            <Table<TradeRow>
+              rowKey="key"
+              columns={tradeColumns}
+              dataSource={selectedTradeRows}
+              size="small"
+              pagination={{
+                current: selectedFillPagination.page,
+                pageSize: selectedFillPagination.pageSize,
+                total: selectedFillPagination.total,
+                showSizeChanger: true,
+                pageSizeOptions: ['20', '50', '100'],
+                onChange: (page, pageSize) => {
+                  void fetchStrategyFillPage(controlStrategyId, page, pageSize);
+                }
+              }}
+              scroll={{ y: 300 }}
+              locale={{ emptyText: '체결 내역이 없습니다.' }}
+            />
+          </Col>
+        </Row>
+      </Card>
     </Flex>
   );
 }

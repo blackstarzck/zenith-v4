@@ -161,3 +161,15 @@
 - [ ] Supabase 호출 공통 래퍼(timeout/retry/catch) 구현
 - [ ] 중복/역순 이벤트 처리(duplicate/out-of-order) 로직 구현
 - [ ] 장애 시 임시 큐 flush 및 `PAUSED` 전환 임계치 설정
+
+# Fill ledger addendum (ASCII appendix)
+- `text_run_events` remains the raw event log.
+- `text_fills` is the normalized persisted fill ledger for strategy fill history and account summary.
+- Persist valid `FILL` events into both stores:
+  1. raw event -> `text_run_events`
+  2. normalized fill -> `text_fills`
+- A duplicate raw event must not block retry insertion of the matching `text_fills` row.
+- Existing environments must roll out in this order:
+  1. apply the `text_fills` schema
+  2. run the historical backfill from `text_run_events`
+  3. deploy code that reads persisted fills from `text_fills`

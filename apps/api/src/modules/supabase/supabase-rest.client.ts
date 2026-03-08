@@ -30,10 +30,32 @@ export class SupabaseRestClient {
     return this.http.patch(normalizedPath, payload, { signal }).then(() => undefined);
   }
 
+  delete(path: string, signal: AbortSignal): Promise<void> {
+    const normalizedPath = path.replace(/^\/+/, '');
+    return this.http.delete(normalizedPath, { signal }).then(() => undefined);
+  }
+
   get<T = unknown>(path: string, signal: AbortSignal): Promise<T> {
     const normalizedPath = path.replace(/^\/+/, '');
     return this.http
       .get(normalizedPath, { signal })
       .then((response) => (response.data ?? {}) as T);
+  }
+
+  getWithMeta<T = unknown>(
+    path: string,
+    signal: AbortSignal,
+    options?: Readonly<{ countExact?: boolean }>
+  ): Promise<Readonly<{ data: T; contentRange?: string }>> {
+    const normalizedPath = path.replace(/^\/+/, '');
+    return this.http.get(normalizedPath, {
+      signal,
+      ...(options?.countExact ? { headers: { Prefer: 'count=exact' } } : {})
+    }).then((response) => ({
+      data: (response.data ?? {}) as T,
+      ...(typeof response.headers['content-range'] === 'string'
+        ? { contentRange: response.headers['content-range'] as string }
+        : {})
+    }));
   }
 }

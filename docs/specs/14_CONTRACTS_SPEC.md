@@ -218,6 +218,8 @@ export type WsEventEnvelopeDto<TPayload = Readonly<Record<string, unknown>>> = R
 - `GET /runs/:runId/candles?limit=300`
 - `GET /runs/:runId/events.jsonl`
 - `GET /runs/:runId/trades.csv`
+- `GET /runs/strategies/:strategyId/fills?page=&pageSize=`
+- `GET /runs/strategies/:strategyId/account-summary`
 - `GET /reports/compare?strategyVersion=&from=&to=&mode=&market=`
 - `PATCH /runs/:runId/control`
   - body:
@@ -254,3 +256,56 @@ export type WsEventEnvelopeDto<TPayload = Readonly<Record<string, unknown>>> = R
   - `riskSnapshot.maxDailyOrders`
   - `riskSnapshot.killSwitch`
   - `updatedAt`
+- `latestEntryReadiness`
+  - `entryReadinessPct`
+  - `entryReady`
+  - `entryExecutable`
+  - `reason`
+  - `inPosition`
+
+`GET /runs/strategies/:strategyId/fills` contract note:
+- returns latest-first fill rows after merging persisted fills and runtime-retained fills
+- must not drop rows just because `MARKET_TICK` events rotated out of the general run event window
+
+`GET /runs/strategies/:strategyId/account-summary` contract note:
+- summary must use the same merged fill source as the fill table so live holdings/PnL do not reset to zero after event retention
+- `markPriceKrw` must resolve to the latest retained strategy market price/candle close when available, not only the last fill price
+- `marketValueKrw`, `equityKrw`, `unrealizedPnlKrw`, `totalPnlKrw`, and `totalPnlPct` are mark-to-market fields and may move on live market updates without a new `FILL`
+- `positionQty`, `avgEntryPriceKrw`, `realizedPnlKrw`, and `fillCount` remain fill-driven fields
+
+`payload.candle` contract note:
+- `payload.candle.time` is the candle start bucket in Unix seconds.
+- For Upbit REST snapshot candles, `payload.candle.time` must be derived from `candle_date_time_utc`, not the REST `timestamp` field.
+
+## 10) Realtime Status Contract Notes (ASCII appendix)
+- `GET /runs/:runId` may include `realtimeStatus`.
+- `realtimeStatus` fields follow `packages/contracts/src/realtime/realtime-status.dto.ts`.
+- `realtimeStatus.connectionState` is a derived view, not a raw websocket field.
+- Derivation priority:
+  1. transport state (`RECONNECTING`, `PAUSED`, `ERROR`)
+  2. snapshot delay
+  3. persistence backlog
+  4. stale last-event age
+  5. `LIVE`
+- `queueDepth`, `retryCount`, and `nextRetryInMs` are optional because they only appear while recovery work is active.
+
+## 11) Persistence Recovery Contract Notes (ASCII appendix)
+- `RealtimeGateway` must not publish a run event to websocket subscribers before DB persistence succeeds.
+- If DB persistence fails, the accepted event remains in runtime memory and enters the ordered persistence buffer for that run.
+- When persistence recovers, buffered events are published in original arrival order for that run.
+
+## 12) Fill Ledger Contract Notes (ASCII appendix)
+- `GET /runs/strategies/:strategyId/fills` must read persisted rows from `public.text_fills`, not by re-filtering `public.text_run_events`.
+- The response shape stays `WsEventEnvelopeDto` for backward compatibility with the web client.
+- `GET /runs/strategies/:strategyId/account-summary` must use the same merged fill source as the fill table:
+  - persisted ledger rows from `text_fills`
+  - runtime-retained fills that are accepted but not fully flushed yet
+- `public.text_run_events` remains available for run detail/history/debugging, but it is not the durable fill ledger.
+
+## 13) Entry Sizing Contract Notes (ASCII appendix)
+- `runConfig.riskSnapshot` includes `seedKrw` and `maxPositionRatio` in addition to daily loss/order/kill-switch fields.
+- BUY execution payload contract:
+  - `ORDER_INTENT.qty`, `FILL.qty`, and `POSITION_UPDATE.qty` must match for one accepted entry
+- SELL execution payload contract:
+  - `ORDER_INTENT.qty` and `FILL.qty` must use the current open position qty, not a default literal
+- `notionalKrw` may be included on `ORDER_INTENT` and `FILL` payloads for display/debugging; clients must treat it as optional metadata.

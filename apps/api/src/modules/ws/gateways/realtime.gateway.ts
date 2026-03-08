@@ -12,6 +12,13 @@ import { SystemEventLogger } from '../../observability/system-events/system-even
 import { RuntimeMetricsService } from '../../observability/runtime-metrics.service';
 import { SequenceGuardService } from '../../resilience/idempotency/sequence-guard';
 import { RunsService } from '../../runs/runs.service';
+import { RunEventPersistenceBuffer } from './run-event-persistence-buffer';
+
+const STRATEGY_RUN_ID: Readonly<Record<'STRAT_A' | 'STRAT_B' | 'STRAT_C', string>> = {
+  STRAT_A: 'run-strat-a-0001',
+  STRAT_B: 'run-strat-b-0001',
+  STRAT_C: 'run-strat-c-0001'
+};
 
 @WebSocketGateway({
   cors: { origin: '*' },
@@ -21,6 +28,7 @@ import { RunsService } from '../../runs/runs.service';
 export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   private server?: Server;
+  private readonly persistenceBuffer: RunEventPersistenceBuffer;
 
   constructor(
     private readonly logger: SystemEventLogger,
@@ -28,7 +36,15 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
     private readonly db: SupabaseClientService,
     private readonly sequenceGuard: SequenceGuardService,
     private readonly runsService: RunsService
-  ) {}
+  ) {
+    this.persistenceBuffer = new RunEventPersistenceBuffer({
+      persist: (event) => this.db.safeInsertRunEvent(event),
+      publish: (event) => this.pushToSubscribers(event),
+      logger: this.logger,
+      metrics: this.metrics,
+      runsService: this.runsService
+    });
+  }
 
   handleConnection(client: Socket): void {
     this.metrics.markWsConnection();
@@ -49,32 +65,33 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
   }
 
   async ingestEngineEvent(event: WsEventEnvelopeDto): Promise<void> {
-    this.metrics.markEvent(event.eventType, event.eventTs);
-    const accepted = this.sequenceGuard.accept(event.runId, event.seq, 'modules.ws.realtime.ingestEngineEvent');
+    const normalizedEvent = this.normalizeRunIdByStrategy(event);
+    this.metrics.markEvent(normalizedEvent.eventType, normalizedEvent.eventTs);
+    const accepted = this.sequenceGuard.accept(normalizedEvent.runId, normalizedEvent.seq, 'modules.ws.realtime.ingestEngineEvent');
     if (accepted === 'duplicate') {
       return;
     }
 
-    const mismatches = this.runsService.validateEventAgainstRunConfig(event);
+    const mismatches = this.runsService.validateEventAgainstRunConfig(normalizedEvent);
     if (mismatches.length > 0) {
       this.metrics.markRunConfigMismatch();
       this.logger.warn('Event payload mismatches runConfig snapshot', {
         source: 'modules.ws.realtime.ingestEngineEvent',
         eventType: SYSTEM_EVENT_TYPE.ENGINE_STATE_INVALID,
-        runId: event.runId,
-        traceId: event.traceId,
-        payload: { seq: event.seq, eventType: event.eventType, mismatches }
+        runId: normalizedEvent.runId,
+        traceId: normalizedEvent.traceId,
+        payload: { seq: normalizedEvent.seq, eventType: normalizedEvent.eventType, mismatches }
       });
       if (process.env.RUNCONFIG_MISMATCH_BLOCK === 'true') {
         const pauseEvent: WsEventEnvelopeDto = {
-          runId: event.runId,
-          seq: event.seq,
-          traceId: event.traceId,
+          runId: normalizedEvent.runId,
+          seq: normalizedEvent.seq,
+          traceId: normalizedEvent.traceId,
           eventType: 'PAUSE',
-          eventTs: event.eventTs,
+          eventTs: normalizedEvent.eventTs,
           payload: {
             reason: 'RUNCONFIG_MISMATCH_BLOCKED',
-            blockedEventType: event.eventType,
+            blockedEventType: normalizedEvent.eventType,
             mismatches
           }
         };
@@ -83,33 +100,20 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
         this.logger.error('Blocked event by RUNCONFIG_MISMATCH_BLOCK guard', {
           source: 'modules.ws.realtime.ingestEngineEvent',
           eventType: SYSTEM_EVENT_TYPE.ENGINE_STATE_INVALID,
-          runId: event.runId,
-          traceId: event.traceId,
-          payload: { seq: event.seq, eventType: event.eventType }
+          runId: normalizedEvent.runId,
+          traceId: normalizedEvent.traceId,
+          payload: { seq: normalizedEvent.seq, eventType: normalizedEvent.eventType }
         });
         return;
       }
     }
 
-    await this.persistAndPublish(event);
+    await this.persistAndPublish(normalizedEvent);
   }
 
   private async persistAndPublish(event: WsEventEnvelopeDto): Promise<void> {
     this.runsService.ingestEvent(event);
-    const persisted = await this.db.safeInsertRunEvent(event);
-    if (!persisted.ok) {
-      this.metrics.markDbWriteFailure();
-      this.logger.warn('Event persistence skipped; runtime loop continues', {
-        source: 'modules.ws.realtime.ingestEngineEvent',
-        eventType: SYSTEM_EVENT_TYPE.DB_WRITE_FAILED,
-        runId: event.runId,
-        traceId: event.traceId,
-        payload: { seq: event.seq, reason: persisted.reason }
-      });
-      return;
-    }
-
-    this.pushToSubscribers(event);
+    await this.persistenceBuffer.enqueue(event);
   }
 
   private pushToSubscribers(event: WsEventEnvelopeDto): void {
@@ -125,5 +129,21 @@ export class RealtimeGateway implements OnGatewayConnection, OnGatewayDisconnect
         payload: { reason: error instanceof Error ? error.message : 'unknown' }
       });
     }
+  }
+
+  private normalizeRunIdByStrategy(event: WsEventEnvelopeDto): WsEventEnvelopeDto {
+    const payload = event.payload as Readonly<Record<string, unknown>>;
+    const strategyId = payload.strategyId;
+    if (strategyId !== 'STRAT_A' && strategyId !== 'STRAT_B' && strategyId !== 'STRAT_C') {
+      return event;
+    }
+    const runId = STRATEGY_RUN_ID[strategyId];
+    if (event.runId === runId) {
+      return event;
+    }
+    return {
+      ...event,
+      runId
+    };
   }
 }

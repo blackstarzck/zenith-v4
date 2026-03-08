@@ -1,5 +1,11 @@
-import type { WsEventEnvelopeDto } from '@zenith/contracts';
+import {
+  CONNECTION_STATE,
+  type ConnectionState,
+  type RealtimeStatusDto,
+  type WsEventEnvelopeDto
+} from '@zenith/contracts';
 import { Injectable } from '@nestjs/common';
+import { resolveRuntimeRiskSnapshot, resolveSeedCapitalKrw } from '../../common/trading-risk';
 import { SupabaseClientService, type PersistedRunRow } from '../../infra/db/supabase/client/supabase.client';
 
 type RunSnapshot = Readonly<{
@@ -27,6 +33,8 @@ type RunConfig = Readonly<{
   fillModelApplied: RunSnapshot['fillModelApplied'];
   entryPolicy: string;
   riskSnapshot: Readonly<{
+    seedKrw: number;
+    maxPositionRatio: number;
     dailyLossLimitPct: number;
     maxConsecutiveLosses: number;
     maxDailyOrders: number;
@@ -87,9 +95,52 @@ type EventConfigMismatch = Readonly<{
   actual: string;
 }>;
 
+type StrategyFillsPage = Readonly<{
+  items: readonly WsEventEnvelopeDto[];
+  total: number;
+  page: number;
+  pageSize: number;
+}>;
+
+type StrategyAccountSummary = Readonly<{
+  strategyId: RunSnapshot['strategyId'];
+  seedCapitalKrw: number;
+  cashKrw: number;
+  positionQty: number;
+  avgEntryPriceKrw: number;
+  markPriceKrw: number;
+  marketValueKrw: number;
+  equityKrw: number;
+  realizedPnlKrw: number;
+  unrealizedPnlKrw: number;
+  totalPnlKrw: number;
+  totalPnlPct: number;
+  fillCount: number;
+  lastFillAt?: string;
+}>;
+
+type RunRealtimeState = Readonly<{
+  transportState: ConnectionState;
+  transportRetryCount: number;
+  transportNextRetryInMs: number | undefined;
+  snapshotDelayed: boolean;
+  persistenceQueueDepth: number;
+  persistenceRetryCount: number;
+  persistenceNextRetryInMs: number | undefined;
+  lastEventAt: string | undefined;
+  staleThresholdMs: number;
+}>;
+
 const EVENT_RETENTION = 500;
+const FILL_EVENT_RETENTION = 500;
 const CANDLE_RETENTION = 5000;
 const PERSISTENCE_HYDRATION_TTL_MS = 15_000;
+const DEFAULT_STALE_THRESHOLD_MS = 60_000;
+const STRATEGY_DEFAULT_RUN_ID: Readonly<Record<RunSnapshot['strategyId'], string>> = {
+  STRAT_A: 'run-strat-a-0001',
+  STRAT_B: 'run-strat-b-0001',
+  STRAT_C: 'run-strat-c-0001'
+};
 
 function isTradeFillEvent(event: WsEventEnvelopeDto): boolean {
   if (event.eventType !== 'FILL') {
@@ -100,16 +151,29 @@ function isTradeFillEvent(event: WsEventEnvelopeDto): boolean {
   return typeof payload.side === 'string' && typeof payload.fillPrice === 'number' && Number.isFinite(payload.fillPrice);
 }
 
+type EntryReadinessSnapshot = Readonly<{
+  entryReadinessPct: number;
+  entryReady: boolean;
+  entryExecutable: boolean;
+  reason: string;
+  inPosition: boolean;
+}>;
+
 @Injectable()
 export class RunsService {
   private readonly runs = new Map<string, RunSnapshot>();
   private readonly runConfigs = new Map<string, RunConfig>();
   private readonly events = new Map<string, WsEventEnvelopeDto[]>();
+  private readonly fillEvents = new Map<string, WsEventEnvelopeDto[]>();
+  private readonly latestEntryReadiness = new Map<string, EntryReadinessSnapshot>();
   private readonly candles = new Map<string, CandleDto[]>();
   private readonly approveTokens = new Map<string, number>();
+  private readonly realtimeStates = new Map<string, RunRealtimeState>();
   private lastPersistenceHydrationAtMs = 0;
 
-  constructor(private readonly db: SupabaseClientService) {}
+  constructor(private readonly db: SupabaseClientService) {
+    this.ensureStrategyRunsSeeded();
+  }
 
   seedRun(runId: string, options?: SeedRunOptions): void {
     if (this.runs.has(runId)) {
@@ -138,18 +202,17 @@ export class RunsService {
       fillModelRequested: 'AUTO',
       fillModelApplied: 'NEXT_OPEN',
       entryPolicy: 'AUTO',
-      riskSnapshot: {
-        dailyLossLimitPct: Number(process.env.RISK_DAILY_LOSS_LIMIT_PCT ?? '-2'),
-        maxConsecutiveLosses: Number(process.env.RISK_MAX_CONSECUTIVE_LOSSES ?? '3'),
-        maxDailyOrders: Number(process.env.RISK_MAX_DAILY_ORDERS ?? '200'),
-        killSwitch: process.env.RISK_KILL_SWITCH !== 'false'
-      },
+      riskSnapshot: resolveRuntimeRiskSnapshot({
+        strategyId: options?.strategyId ?? 'STRAT_B'
+      }),
       updatedAt: new Date().toISOString()
     });
 
     this.events.set(runId, []);
+    this.fillEvents.set(runId, []);
     this.candles.set(runId, []);
     this.approveTokens.set(runId, 0);
+    this.realtimeStates.set(runId, this.realtimeStates.get(runId) ?? defaultRunRealtimeState());
   }
 
   ingestEvent(event: WsEventEnvelopeDto): void {
@@ -160,6 +223,17 @@ export class RunsService {
     this.events.set(event.runId, arr.slice(-EVENT_RETENTION));
 
     const payload = event.payload as Readonly<Record<string, unknown>>;
+    if (isTradeFillEvent(event)) {
+      const fills = this.fillEvents.get(event.runId) ?? [];
+      fills.push(event);
+      this.fillEvents.set(event.runId, fills.slice(-FILL_EVENT_RETENTION));
+    }
+    if (event.eventType === 'ENTRY_READINESS') {
+      const snapshot = toEntryReadinessSnapshot(payload);
+      if (snapshot) {
+        this.latestEntryReadiness.set(event.runId, snapshot);
+      }
+    }
     const candle = this.extractCandle(payload);
     if (candle) {
       this.upsertCandle(event.runId, candle);
@@ -176,9 +250,12 @@ export class RunsService {
       lastSeq: Math.max(prev.lastSeq, event.seq),
       lastEventAt: event.eventTs
     });
+    this.patchRealtimeState(event.runId, {
+      lastEventAt: event.eventTs
+    });
   }
 
-  async hydrateRecentRuns(limit = 30): Promise<void> {
+  async hydrateRecentRuns(limit = 300): Promise<void> {
     if (Date.now() - this.lastPersistenceHydrationAtMs < PERSISTENCE_HYDRATION_TTL_MS) {
       return;
     }
@@ -188,6 +265,7 @@ export class RunsService {
       for (const row of rows) {
         await this.restoreRun(row.runId, row);
       }
+      this.ensureStrategyRunsSeeded();
       this.lastPersistenceHydrationAtMs = Date.now();
     } catch {
       // Persistence hydration is best-effort. Runtime memory remains the source of truth while live.
@@ -207,7 +285,10 @@ export class RunsService {
         return;
       }
 
-      const events = await this.db.listRunEvents(runId, EVENT_RETENTION);
+      const [events, latestEntryReadinessEvent] = await Promise.all([
+        this.db.listRunEvents(runId, EVENT_RETENTION),
+        this.db.getLatestRunEventByType(runId, 'ENTRY_READINESS')
+      ]);
       const lastEvent = events[events.length - 1];
       const fillModelApplied = row.fillModelApplied === 'ON_CLOSE' ? 'ON_CLOSE' : 'NEXT_OPEN';
 
@@ -238,6 +319,16 @@ export class RunsService {
       }));
 
       this.events.set(runId, [...events].slice(-EVENT_RETENTION));
+      const retainedFills = events.filter(isTradeFillEvent);
+      this.fillEvents.set(runId, retainedFills.slice(-FILL_EVENT_RETENTION));
+      const latestSnapshot = latestEntryReadinessEvent
+        ? toEntryReadinessSnapshot(latestEntryReadinessEvent.payload as Readonly<Record<string, unknown>>)
+        : getLatestEntryReadinessFromEvents(events);
+      if (latestSnapshot) {
+        this.latestEntryReadiness.set(runId, latestSnapshot);
+      } else {
+        this.latestEntryReadiness.delete(runId);
+      }
       this.candles.set(runId, []);
       events.forEach((event) => {
         const candle = this.extractCandle(event.payload as Readonly<Record<string, unknown>>);
@@ -246,6 +337,9 @@ export class RunsService {
         }
       });
       this.approveTokens.set(runId, this.approveTokens.get(runId) ?? 0);
+      this.realtimeStates.set(runId, this.realtimeStates.get(runId) ?? defaultRunRealtimeState({
+        ...(lastEvent?.eventTs ? { lastEventAt: lastEvent.eventTs } : {})
+      }));
     } catch {
       // Ignore restore failures and keep serving in-memory runtime state.
     }
@@ -256,7 +350,8 @@ export class RunsService {
   }
 
   async listRuns(filters?: RunHistoryFilters): Promise<Array<RunSnapshot & RunKpi>> {
-    await this.hydrateRecentRuns();
+    const hydrationLimit = filters?.strategyId ? 500 : 300;
+    await this.hydrateRecentRuns(hydrationLimit);
 
     return [...this.runs.values()]
       .filter((run) => {
@@ -287,8 +382,20 @@ export class RunsService {
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
-  async getRun(runId: string): Promise<(RunSnapshot & { runConfig: RunConfig; events: WsEventEnvelopeDto[]; kpi: RunKpi }) | undefined> {
+  async getRun(runId: string): Promise<(RunSnapshot & {
+    runConfig: RunConfig;
+    events: WsEventEnvelopeDto[];
+    kpi: RunKpi;
+    latestEntryReadiness?: EntryReadinessSnapshot;
+    realtimeStatus?: RealtimeStatusDto;
+  }) | undefined> {
     await this.restoreRun(runId);
+    if (!this.runs.has(runId)) {
+      const inferred = inferStrategyIdFromRunId(runId);
+      if (inferred) {
+        this.seedRun(runId, { strategyId: inferred });
+      }
+    }
 
     const run = this.runs.get(runId);
     const runConfig = this.runConfigs.get(runId);
@@ -299,12 +406,185 @@ export class RunsService {
       return undefined;
     }
     const events = this.events.get(runId) ?? [];
+    const latestEntryReadiness = this.latestEntryReadiness.get(runId);
+    const realtimeStatus = this.getRealtimeStatus(runId);
     return {
       ...run,
       runConfig,
       events,
-      kpi: this.computeKpi(events)
+      kpi: this.computeKpi(events),
+      ...(latestEntryReadiness ? { latestEntryReadiness } : {}),
+      ...(realtimeStatus ? { realtimeStatus } : {})
     };
+  }
+
+  getRealtimeStatus(runId: string): RealtimeStatusDto | undefined {
+    const state = this.realtimeStates.get(runId);
+    return state ? toRealtimeStatusDto(state) : undefined;
+  }
+
+  setTransportState(
+    runId: string,
+    connectionState: ConnectionState,
+    input?: Readonly<{
+      retryCount?: number;
+      nextRetryInMs?: number;
+      staleThresholdMs?: number;
+    }>
+  ): RealtimeStatusDto {
+    this.seedRun(runId);
+    const state = this.patchRealtimeState(runId, {
+      transportState: connectionState,
+      transportRetryCount: input?.retryCount ?? 0,
+      ...(typeof input?.nextRetryInMs === 'number'
+        ? { transportNextRetryInMs: input.nextRetryInMs }
+        : { transportNextRetryInMs: undefined }),
+      ...(typeof input?.staleThresholdMs === 'number'
+        ? { staleThresholdMs: input.staleThresholdMs }
+        : {})
+    });
+    return toRealtimeStatusDto(state);
+  }
+
+  setSnapshotDelay(
+    runId: string,
+    delayed: boolean,
+    staleThresholdMs = DEFAULT_STALE_THRESHOLD_MS
+  ): RealtimeStatusDto {
+    this.seedRun(runId);
+    const state = this.patchRealtimeState(runId, {
+      snapshotDelayed: delayed,
+      staleThresholdMs
+    });
+    return toRealtimeStatusDto(state);
+  }
+
+  setPersistenceBacklog(
+    runId: string,
+    input: Readonly<{
+      queueDepth: number;
+      retryCount?: number;
+      nextRetryInMs?: number;
+    }>
+  ): RealtimeStatusDto {
+    this.seedRun(runId);
+    const state = this.patchRealtimeState(runId, {
+      persistenceQueueDepth: Math.max(0, input.queueDepth),
+      persistenceRetryCount: Math.max(0, input.retryCount ?? 0),
+      ...(typeof input.nextRetryInMs === 'number'
+        ? { persistenceNextRetryInMs: input.nextRetryInMs }
+        : { persistenceNextRetryInMs: undefined })
+    });
+    return toRealtimeStatusDto(state);
+  }
+
+  async listStrategyFills(
+    strategyId: RunSnapshot['strategyId'],
+    page = 1,
+    pageSize = 50
+  ): Promise<StrategyFillsPage> {
+    const safePage = Math.max(1, Math.floor(page));
+    const safePageSize = Math.max(1, Math.min(Math.floor(pageSize), 200));
+    const fills = await this.listMergedStrategyFillEvents(strategyId);
+    const offset = (safePage - 1) * safePageSize;
+
+    return {
+      items: fills.slice(offset, offset + safePageSize),
+      total: fills.length,
+      page: safePage,
+      pageSize: safePageSize
+    };
+  }
+
+  async getStrategyAccountSummary(strategyId: RunSnapshot['strategyId']): Promise<StrategyAccountSummary> {
+    await this.hydrateRecentRuns(500);
+    const seedCapitalKrw = resolveSeedCapitalKrw(strategyId);
+    const fills = [...(await this.listMergedStrategyFillEvents(strategyId))]
+      .sort((a, b) => {
+        const tsDiff = Date.parse(a.eventTs) - Date.parse(b.eventTs);
+        if (Number.isFinite(tsDiff) && tsDiff !== 0) {
+          return tsDiff;
+        }
+        return a.seq - b.seq;
+      });
+
+    let cashKrw = seedCapitalKrw;
+    let positionQty = 0;
+    let avgEntryPriceKrw = 0;
+    let realizedPnlKrw = 0;
+    let markPriceKrw = 0;
+    let lastFillAt: string | undefined;
+
+    fills.forEach((fill) => {
+      const payload = fill.payload as Readonly<Record<string, unknown>>;
+      const side = typeof payload.side === 'string' ? payload.side.toUpperCase() : '';
+      const fillPrice = typeof payload.fillPrice === 'number' && Number.isFinite(payload.fillPrice)
+        ? payload.fillPrice
+        : undefined;
+      const qty = resolveFillQty(payload);
+      if (!fillPrice || qty <= 0) {
+        return;
+      }
+
+      markPriceKrw = fillPrice;
+      lastFillAt = fill.eventTs;
+
+      if (side === 'BUY') {
+        const nextQty = positionQty + qty;
+        if (nextQty > 0) {
+          avgEntryPriceKrw = ((avgEntryPriceKrw * positionQty) + (fillPrice * qty)) / nextQty;
+        }
+        positionQty = nextQty;
+        cashKrw -= fillPrice * qty;
+        return;
+      }
+
+      if (side === 'SELL') {
+        const matchedQty = Math.min(positionQty, qty);
+        if (matchedQty > 0) {
+          realizedPnlKrw += (fillPrice - avgEntryPriceKrw) * matchedQty;
+        }
+        positionQty = Math.max(0, positionQty - qty);
+        if (positionQty === 0) {
+          avgEntryPriceKrw = 0;
+        }
+        cashKrw += fillPrice * qty;
+      }
+    });
+
+    const latestMarkPriceKrw = this.resolveLatestStrategyMarkPrice(strategyId);
+    if (typeof latestMarkPriceKrw === 'number' && latestMarkPriceKrw > 0) {
+      markPriceKrw = latestMarkPriceKrw;
+    } else if (markPriceKrw <= 0 && avgEntryPriceKrw > 0) {
+      markPriceKrw = avgEntryPriceKrw;
+    }
+
+    const marketValueKrw = positionQty * markPriceKrw;
+    const equityKrw = cashKrw + marketValueKrw;
+    const unrealizedPnlKrw = positionQty > 0 ? (markPriceKrw - avgEntryPriceKrw) * positionQty : 0;
+    const totalPnlKrw = equityKrw - seedCapitalKrw;
+    const totalPnlPct = seedCapitalKrw > 0 ? (totalPnlKrw / seedCapitalKrw) * 100 : 0;
+
+    return {
+      strategyId,
+      seedCapitalKrw: roundMoney(seedCapitalKrw),
+      cashKrw: roundMoney(cashKrw),
+      positionQty: roundQty(positionQty),
+      avgEntryPriceKrw: roundMoney(avgEntryPriceKrw),
+      markPriceKrw: roundMoney(markPriceKrw),
+      marketValueKrw: roundMoney(marketValueKrw),
+      equityKrw: roundMoney(equityKrw),
+      realizedPnlKrw: roundMoney(realizedPnlKrw),
+      unrealizedPnlKrw: roundMoney(unrealizedPnlKrw),
+      totalPnlKrw: roundMoney(totalPnlKrw),
+      totalPnlPct: roundPct(totalPnlPct),
+      fillCount: fills.length,
+      ...(lastFillAt ? { lastFillAt } : {})
+    };
+  }
+
+  async purgeInvalidFillEvents(): Promise<Readonly<{ deleted: number; scanned: number }>> {
+    return this.db.purgeInvalidFillEvents();
   }
 
   getRunConfig(runId: string): RunConfig | undefined {
@@ -313,7 +593,11 @@ export class RunsService {
 
   approvePendingEntry(runId: string): boolean {
     if (!this.runs.has(runId)) {
-      return false;
+      const inferred = inferStrategyIdFromRunId(runId);
+      if (!inferred) {
+        return false;
+      }
+      this.seedRun(runId, { strategyId: inferred });
     }
     const next = (this.approveTokens.get(runId) ?? 0) + 1;
     this.approveTokens.set(runId, next);
@@ -407,7 +691,9 @@ export class RunsService {
     const cappedLimit = Math.max(1, Math.min(1000, limit));
     const stored = this.candles.get(runId) ?? [];
     if (stored.length > 0) {
-      return stored.slice(-cappedLimit);
+      const normalizedStored = normalizeMinuteCandles(stored);
+      this.candles.set(runId, normalizedStored.slice(-CANDLE_RETENTION));
+      return normalizedStored.slice(-cappedLimit);
     }
 
     const map = new Map<number, CandleDto>();
@@ -422,9 +708,7 @@ export class RunsService {
       map.set(candle.time, candle);
     });
 
-    const derived = [...map.values()]
-      .sort((a, b) => a.time - b.time)
-      .slice(-cappedLimit);
+    const derived = normalizeMinuteCandles([...map.values()]).slice(-cappedLimit);
     if (derived.length > 0) {
       this.candles.set(runId, derived.slice(-CANDLE_RETENTION));
     }
@@ -432,6 +716,18 @@ export class RunsService {
   }
 
   async updateRunControl(runId: string, input: RunControlInput): Promise<RunSnapshot | undefined> {
+    if (!this.runs.has(runId) || !this.runConfigs.has(runId)) {
+      const inferredStrategyId = input.strategyId ?? inferStrategyIdFromRunId(runId);
+      if (inferredStrategyId) {
+        this.seedRun(runId, {
+          strategyId: inferredStrategyId,
+          ...(input.strategyVersion ? { strategyVersion: input.strategyVersion } : {}),
+          ...(input.mode ? { mode: input.mode } : {}),
+          ...(input.market ? { market: input.market } : {})
+        });
+      }
+    }
+
     const prev = this.runs.get(runId);
     const prevConfig = this.runConfigs.get(runId);
     if (!prev) {
@@ -474,6 +770,60 @@ export class RunsService {
     return next;
   }
 
+  private ensureStrategyRunsSeeded(): void {
+    this.seedRun(STRATEGY_DEFAULT_RUN_ID.STRAT_A, { strategyId: 'STRAT_A' });
+    this.seedRun(STRATEGY_DEFAULT_RUN_ID.STRAT_B, { strategyId: 'STRAT_B' });
+    this.seedRun(STRATEGY_DEFAULT_RUN_ID.STRAT_C, { strategyId: 'STRAT_C' });
+  }
+
+  private patchRealtimeState(
+    runId: string,
+    patch: Partial<RunRealtimeState>
+  ): RunRealtimeState {
+    const prev = this.realtimeStates.get(runId) ?? defaultRunRealtimeState();
+    const next: RunRealtimeState = {
+      ...prev,
+      ...patch
+    };
+    this.realtimeStates.set(runId, next);
+    return next;
+  }
+
+  private async listMergedStrategyFillEvents(
+    strategyId: RunSnapshot['strategyId']
+  ): Promise<readonly WsEventEnvelopeDto[]> {
+    const persisted = await this.db.listAllStrategyFillEvents(strategyId);
+    const runtime = [...this.runs.values()]
+      .filter((run) => run.strategyId === strategyId)
+      .flatMap((run) => this.fillEvents.get(run.runId) ?? []);
+    return mergeEventsByRecency(persisted, runtime)
+      .filter(isTradeFillEvent);
+  }
+
+  private resolveLatestStrategyMarkPrice(
+    strategyId: RunSnapshot['strategyId']
+  ): number | undefined {
+    const candidates = [...this.runs.values()]
+      .filter((run) => run.strategyId === strategyId)
+      .sort((a, b) => {
+        const tsDiff = Date.parse(b.lastEventAt ?? b.createdAt) - Date.parse(a.lastEventAt ?? a.createdAt);
+        if (Number.isFinite(tsDiff) && tsDiff !== 0) {
+          return tsDiff;
+        }
+        return b.lastSeq - a.lastSeq;
+      });
+
+    for (const run of candidates) {
+      const candles = this.candles.get(run.runId);
+      const latest = candles?.[candles.length - 1];
+      if (latest && Number.isFinite(latest.close) && latest.close > 0) {
+        return latest.close;
+      }
+    }
+
+    return undefined;
+  }
+
   private buildDefaultRunConfig(input: Readonly<{
     runId: string;
     strategyId: RunSnapshot['strategyId'];
@@ -493,12 +843,9 @@ export class RunsService {
       fillModelRequested: input.fillModelRequested,
       fillModelApplied: input.fillModelApplied,
       entryPolicy: 'AUTO',
-      riskSnapshot: {
-        dailyLossLimitPct: Number(process.env.RISK_DAILY_LOSS_LIMIT_PCT ?? '-2'),
-        maxConsecutiveLosses: Number(process.env.RISK_MAX_CONSECUTIVE_LOSSES ?? '3'),
-        maxDailyOrders: Number(process.env.RISK_MAX_DAILY_ORDERS ?? '200'),
-        killSwitch: process.env.RISK_KILL_SWITCH !== 'false'
-      },
+      riskSnapshot: resolveRuntimeRiskSnapshot({
+        strategyId: input.strategyId
+      }),
       updatedAt: input.updatedAt
     };
   }
@@ -566,7 +913,7 @@ export class RunsService {
     }
 
     return {
-      time,
+      time: normalizeMinuteCandleTime(time),
       open,
       high,
       low,
@@ -623,4 +970,217 @@ export class RunsService {
     }
     this.candles.set(runId, nextCandles.slice(-CANDLE_RETENTION));
   }
+}
+
+function inferStrategyIdFromRunId(runId: string): RunSnapshot['strategyId'] | undefined {
+  if (runId === STRATEGY_DEFAULT_RUN_ID.STRAT_A || runId.startsWith('run-strat-a-')) {
+    return 'STRAT_A';
+  }
+  if (runId === STRATEGY_DEFAULT_RUN_ID.STRAT_B || runId.startsWith('run-strat-b-')) {
+    return 'STRAT_B';
+  }
+  if (runId === STRATEGY_DEFAULT_RUN_ID.STRAT_C || runId.startsWith('run-strat-c-')) {
+    return 'STRAT_C';
+  }
+  return undefined;
+}
+
+function resolveFillQty(payload: Readonly<Record<string, unknown>>): number {
+  const qty = payload.qty;
+  if (typeof qty === 'number' && Number.isFinite(qty) && qty > 0) {
+    return qty;
+  }
+  const quantity = payload.quantity;
+  if (typeof quantity === 'number' && Number.isFinite(quantity) && quantity > 0) {
+    return quantity;
+  }
+  return 1;
+}
+
+function roundMoney(value: number): number {
+  return Number(value.toFixed(2));
+}
+
+function roundQty(value: number): number {
+  return Number(value.toFixed(8));
+}
+
+function roundPct(value: number): number {
+  return Number(value.toFixed(4));
+}
+
+function normalizeMinuteCandleTime(time: number): number {
+  return Math.floor(time / 60) * 60;
+}
+
+function normalizeMinuteCandles(candles: readonly CandleDto[]): CandleDto[] {
+  const byTime = new Map<number, CandleDto>();
+  candles.forEach((candle) => {
+    byTime.set(normalizeMinuteCandleTime(candle.time), {
+      ...candle,
+      time: normalizeMinuteCandleTime(candle.time)
+    });
+  });
+  return [...byTime.values()].sort((a, b) => a.time - b.time);
+}
+
+function getLatestEntryReadinessFromEvents(events: readonly WsEventEnvelopeDto[]): EntryReadinessSnapshot | undefined {
+  const latest = [...events]
+    .filter((event) => event.eventType === 'ENTRY_READINESS')
+    .sort(compareEventsByRecency)[0];
+  if (!latest) {
+    return undefined;
+  }
+  return toEntryReadinessSnapshot(latest.payload as Readonly<Record<string, unknown>>);
+}
+
+function toEntryReadinessSnapshot(payload: Readonly<Record<string, unknown>>): EntryReadinessSnapshot | undefined {
+  const entryReadinessPct = payload.entryReadinessPct;
+  const entryReady = payload.entryReady;
+  const entryExecutable = payload.entryExecutable;
+  const reason = payload.reason;
+  const inPosition = payload.inPosition;
+
+  if (
+    typeof entryReadinessPct !== 'number' &&
+    typeof entryReady !== 'boolean' &&
+    typeof entryExecutable !== 'boolean' &&
+    typeof reason !== 'string' &&
+    typeof inPosition !== 'boolean'
+  ) {
+    return undefined;
+  }
+
+  return {
+    entryReadinessPct: normalizeEntryReadinessPct(entryReadinessPct),
+    entryReady: entryReady === true,
+    entryExecutable: entryExecutable === true,
+    reason: typeof reason === 'string' ? reason : 'ENTRY_WAIT',
+    inPosition: inPosition === true
+  };
+}
+
+function normalizeEntryReadinessPct(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.round(Math.min(100, Math.max(0, value)));
+}
+
+function mergeEventsByRecency(
+  ...groups: ReadonlyArray<readonly WsEventEnvelopeDto[]>
+): WsEventEnvelopeDto[] {
+  const byKey = new Map<string, WsEventEnvelopeDto>();
+  groups.forEach((group) => {
+    group.forEach((event) => {
+      byKey.set(toEventKey(event), event);
+    });
+  });
+  return [...byKey.values()].sort(compareEventsByRecency);
+}
+
+function toEventKey(event: Pick<WsEventEnvelopeDto, 'runId' | 'seq'>): string {
+  return `${event.runId}:${event.seq}`;
+}
+
+function compareEventsByRecency(a: WsEventEnvelopeDto, b: WsEventEnvelopeDto): number {
+  const tsDiff = Date.parse(b.eventTs) - Date.parse(a.eventTs);
+  if (Number.isFinite(tsDiff) && tsDiff !== 0) {
+    return tsDiff;
+  }
+  return b.seq - a.seq;
+}
+
+function defaultRunRealtimeState(
+  input?: Partial<RunRealtimeState>
+): RunRealtimeState {
+  return {
+    transportState: CONNECTION_STATE.LIVE,
+    transportRetryCount: 0,
+    transportNextRetryInMs: undefined,
+    snapshotDelayed: false,
+    persistenceQueueDepth: 0,
+    persistenceRetryCount: 0,
+    persistenceNextRetryInMs: undefined,
+    lastEventAt: undefined,
+    staleThresholdMs: DEFAULT_STALE_THRESHOLD_MS,
+    ...input
+  };
+}
+
+function toRealtimeStatusDto(
+  state: RunRealtimeState,
+  nowMs = Date.now()
+): RealtimeStatusDto {
+  const connectionState = resolveRealtimeConnectionState(state, nowMs);
+  const retry = resolveRealtimeRetryMetadata(state, connectionState);
+
+  return {
+    connectionState,
+    ...(state.lastEventAt ? { lastEventAt: state.lastEventAt } : {}),
+    ...(state.persistenceQueueDepth > 0 ? { queueDepth: state.persistenceQueueDepth } : {}),
+    ...retry,
+    staleThresholdMs: state.staleThresholdMs
+  };
+}
+
+function resolveRealtimeConnectionState(
+  state: RunRealtimeState,
+  nowMs: number
+): ConnectionState {
+  if (
+    state.transportState === CONNECTION_STATE.RECONNECTING ||
+    state.transportState === CONNECTION_STATE.PAUSED ||
+    state.transportState === CONNECTION_STATE.ERROR
+  ) {
+    return state.transportState;
+  }
+
+  if (state.snapshotDelayed || state.persistenceQueueDepth > 0 || isRealtimeStateStale(state, nowMs)) {
+    return CONNECTION_STATE.DELAYED;
+  }
+
+  return CONNECTION_STATE.LIVE;
+}
+
+function resolveRealtimeRetryMetadata(
+  state: RunRealtimeState,
+  connectionState: ConnectionState
+): Partial<Pick<RealtimeStatusDto, 'retryCount' | 'nextRetryInMs'>> {
+  if (
+    connectionState === CONNECTION_STATE.RECONNECTING ||
+    connectionState === CONNECTION_STATE.PAUSED ||
+    connectionState === CONNECTION_STATE.ERROR
+  ) {
+    return {
+      retryCount: state.transportRetryCount,
+      ...(typeof state.transportNextRetryInMs === 'number'
+        ? { nextRetryInMs: state.transportNextRetryInMs }
+        : {})
+    };
+  }
+
+  if (state.persistenceQueueDepth > 0) {
+    return {
+      retryCount: state.persistenceRetryCount,
+      ...(typeof state.persistenceNextRetryInMs === 'number'
+        ? { nextRetryInMs: state.persistenceNextRetryInMs }
+        : {})
+    };
+  }
+
+  return {};
+}
+
+function isRealtimeStateStale(state: RunRealtimeState, nowMs: number): boolean {
+  if (!state.lastEventAt) {
+    return false;
+  }
+
+  const lastEventAtMs = Date.parse(state.lastEventAt);
+  if (!Number.isFinite(lastEventAtMs)) {
+    return false;
+  }
+
+  return nowMs - lastEventAtMs > state.staleThresholdMs;
 }

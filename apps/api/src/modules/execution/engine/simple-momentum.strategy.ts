@@ -1,3 +1,5 @@
+import { buildExitSequence, buildLongEntrySequence, type StrategyEventDecision } from './execution-sequence';
+
 export type StrategyCandle = Readonly<{
   time: number;
   open: number;
@@ -56,6 +58,8 @@ export type MomentumState = Readonly<{
   inPosition: boolean;
   entryPrice?: number;
   entryTime?: number;
+  positionQty?: number;
+  entryNotionalKrw?: number;
   barsHeld: number;
   recentCandles: readonly StrategyCandle[];
   stratA?: Readonly<{
@@ -66,11 +70,6 @@ export type MomentumState = Readonly<{
     poiHigh?: number;
     poiExpiresAt?: number;
   }>;
-}>;
-
-export type StrategyEventDecision = Readonly<{
-  eventType: 'SIGNAL_EMIT' | 'ORDER_INTENT' | 'FILL' | 'POSITION_UPDATE' | 'EXIT';
-  payload: Readonly<Record<string, unknown>>;
 }>;
 
 export type EvaluateResult = Readonly<{
@@ -97,44 +96,10 @@ export function evaluateMomentumCandle(
   config: MomentumConfig = DEFAULT_MOMENTUM_CONFIG
 ): EvaluateResult {
   const nextHistory = [...state.recentCandles, candle].slice(-60);
-  const decisions: StrategyEventDecision[] = [];
   const candleReturnPct = ((candle.close - candle.open) / candle.open) * 100;
 
   if (!state.inPosition) {
     if (candleReturnPct >= config.entryThresholdPct) {
-      decisions.push({
-        eventType: 'SIGNAL_EMIT',
-        payload: {
-          signal: 'LONG_ENTRY',
-          candleReturnPct: round(candleReturnPct),
-          thresholdPct: config.entryThresholdPct
-        }
-      });
-      decisions.push({
-        eventType: 'ORDER_INTENT',
-        payload: {
-          side: 'BUY',
-          qty: 1,
-          price: candle.close,
-          reason: 'MOMENTUM_ENTRY'
-        }
-      });
-      decisions.push({
-        eventType: 'FILL',
-        payload: {
-          side: 'BUY',
-          qty: 1,
-          fillPrice: candle.close
-        }
-      });
-      decisions.push({
-        eventType: 'POSITION_UPDATE',
-        payload: {
-          side: 'LONG',
-          qty: 1,
-          avgEntry: candle.close
-        }
-      });
       return {
         nextState: {
           inPosition: true,
@@ -143,7 +108,16 @@ export function evaluateMomentumCandle(
           barsHeld: 0,
           recentCandles: nextHistory
         },
-        decisions
+        decisions: buildLongEntrySequence({
+          price: candle.close,
+          orderReason: 'MOMENTUM_ENTRY',
+          signalPayload: {
+            signal: 'LONG_ENTRY',
+            reason: 'MOMENTUM_ENTRY',
+            candleReturnPct: round(candleReturnPct),
+            thresholdPct: config.entryThresholdPct
+          }
+        })
       };
     }
 
@@ -152,7 +126,7 @@ export function evaluateMomentumCandle(
         ...state,
         recentCandles: nextHistory
       },
-      decisions
+      decisions: []
     };
   }
 
@@ -163,7 +137,7 @@ export function evaluateMomentumCandle(
         ...INITIAL_MOMENTUM_STATE,
         recentCandles: nextHistory
       },
-      decisions
+      decisions: []
     };
   }
 
@@ -180,51 +154,26 @@ export function evaluateMomentumCandle(
         recentCandles: nextHistory,
         barsHeld
       },
-      decisions
+      decisions: []
     };
   }
 
   const reason = shouldTakeProfit ? 'TP' : shouldStopLoss ? 'SL' : 'TIME';
-  decisions.push({
-    eventType: 'EXIT',
-    payload: {
-      reason,
-      pnlPct: round(pnlPct),
-      barsHeld
-    }
-  });
-  decisions.push({
-    eventType: 'ORDER_INTENT',
-    payload: {
-      side: 'SELL',
-      qty: 1,
-      price: candle.close,
-      reason: `MOMENTUM_${reason}`
-    }
-  });
-  decisions.push({
-    eventType: 'FILL',
-    payload: {
-      side: 'SELL',
-      qty: 1,
-      fillPrice: candle.close
-    }
-  });
-  decisions.push({
-    eventType: 'POSITION_UPDATE',
-    payload: {
-      side: 'FLAT',
-      qty: 0,
-      realizedPnlPct: round(pnlPct)
-    }
-  });
 
   return {
     nextState: {
       ...INITIAL_MOMENTUM_STATE,
       recentCandles: nextHistory
     },
-    decisions
+    decisions: buildExitSequence({
+      price: candle.close,
+      orderReason: `MOMENTUM_${reason}`,
+      exitPayload: {
+        reason,
+        pnlPct: round(pnlPct),
+        barsHeld
+      }
+    })
   };
 }
 

@@ -194,12 +194,14 @@ sequenceDiagram
      - orderId, side, type, price, qty, status, createdAt, cancel
    - Fills 카드(최근 체결)
      - fillTime, price, qty, reason, slippage(추정)
+     - data source must survive general event retention; do not rely on only the recent run event window
 
 3) **Risk Monitor**
    - dailyLossLimit 사용량 바(현재 vs 한도)
    - maxConsecutiveLosses 카운터
    - maxDailyOrders 카운터
    - 최근 RISK_BLOCK 목록(시간/원인)
+   - entry readiness must read the latest retained readiness snapshot, not only the latest 500 events
 
 4) 하단 탭
    - Trades: `TradeTable`
@@ -530,3 +532,57 @@ stateDiagram-v2
 - 목록 필터/정렬이 URL로 복원되는가?
 - SEMI_AUTO에서 승인 이벤트/진입 지연이 시각적으로 확인되는가?
 - Exit Reason/우선순위 규칙이 UI로 확인 가능한가?
+
+## 7) Realtime Status Badge Notes
+- 라이브 화면은 섹션 제어 영역에서 backlog를 포함한 실시간 상태를 바로 보여줘야 한다.
+- 현재 배지는 아래 필드를 표시한다.
+  - `connectionState`
+  - `lastEventAt`
+  - 영속화 복구 중일 때 `queueDepth`
+  - `retryCount`
+  - 재연결 또는 영속화 재시도가 예약되어 있을 때 `nextRetryInMs`
+- 제어 중인 전략은 다음 규칙을 따른다.
+  - 로컬 소켓 재연결 상태와 pending action 상태는 즉시 반영한다.
+  - backlog 깊이와 delayed 상태는 서버 `realtimeStatus`를 기준으로 유지한다.
+- 제어 대상이 아닌 전략 섹션은 최근 서버 조회 시점의 `realtimeStatus` 스냅샷을 표시해도 된다.
+
+## 8) Chart Time Zone Notes (ASCII appendix)
+- `ChartPanel` must render time-axis labels and the crosshair time label in `Asia/Seoul` (`KST`).
+- Candle payloads remain Unix-second bucket values in the API contract.
+- Time zone conversion is display-only in the web chart layer.
+- Intraday tick marks should stay compact, while the crosshair label should show full `YYYY-MM-DD HH:mm KST`.
+
+## 9) Merged Live Layout Notes (ASCII appendix)
+- `/runs/live` now renders a single merged strategy workspace instead of three repeated strategy sections.
+- Top row layout:
+  - left: chart for the currently selected strategy
+  - right: strategy comparison table for `STRAT_A`, `STRAT_B`, `STRAT_C`
+- The comparison table must include these columns:
+  - strategy type
+  - total PnL and total return
+  - position quantity
+  - average entry price
+  - average return split by positive/negative
+  - today's cumulative PnL amount
+  - MDD
+  - entry readiness
+  - win rate and cumulative return
+- Clicking a strategy row in the comparison table changes the chart/control/fills target strategy.
+- The lower row keeps execution controls and fill history for the currently selected strategy.
+
+## 10) Strategy Summary Realtime Metric Notes (ASCII appendix)
+- The `/runs/live` strategy comparison table must treat account summary rows as mixed-source metrics.
+- Fill-driven fields:
+  - `positionQty`
+  - `avgEntryPriceKrw`
+  - `realizedPnlKrw`
+  - `fillCount`
+- Mark-to-market fields:
+  - `markPriceKrw`
+  - `marketValueKrw`
+  - `equityKrw`
+  - `unrealizedPnlKrw`
+  - `totalPnlKrw`
+  - `totalPnlPct`
+- Mark-to-market fields should move on live candle/tick updates without requiring a manual refresh.
+- Exit/KPI-driven fields such as `todayPnlAmount`, `winRate`, `sumReturnPct`, `avgWinPct`, `avgLossPct`, and `mddPct` should keep following exit/KPI events rather than every price tick.

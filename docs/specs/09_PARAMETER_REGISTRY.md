@@ -120,3 +120,14 @@
 | c.cooldown.afterStopMinutes | number | 5 | 0~240 | MED | cooldown |
 | c.pause.consecutiveStops | number | 2 | 1~20 | HIGH | pause |
 | c.pause.minutes | number | 20 | 1~10000 | HIGH | pause |
+
+---
+
+## 5) Position Sizing Note (ASCII appendix, 2026-03-08)
+- Runtime entry sizing must not fall back to an implicit fixed `qty=1` when `common.seedKrw` and `common.risk.maxPositionRatio` are configured.
+- Account base KRW for entry sizing:
+  1. use the latest strategy account equity when it is available from the merged fill/account summary path
+  2. otherwise fall back to `common.seedKrw`
+- Entry target notional KRW = `accountBaseKrw * common.risk.maxPositionRatio`
+- Entry qty = `floor(entryNotionalKrw / fillPrice, 8 decimals)`
+- Exit qty must reuse the currently open runtime position qty.

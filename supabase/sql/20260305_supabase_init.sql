@@ -70,6 +70,23 @@ create table if not exists public.text_run_events (
 create index if not exists idx_run_events_run_ts on public.text_run_events (run_id, event_ts);
 create index if not exists idx_run_events_type_ts on public.text_run_events (event_type, event_ts desc);
 
+create table if not exists public.text_fills (
+  id bigserial primary key,
+  run_id text not null references public.text_runs(run_id) on delete cascade,
+  seq bigint not null,
+  event_ts timestamptz not null,
+  trace_id text not null,
+  side text not null check (side in ('BUY', 'SELL')),
+  qty numeric(28,12) not null,
+  fill_price numeric(20,8) not null,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  unique (run_id, seq)
+);
+
+create index if not exists idx_fills_run_ts on public.text_fills (run_id, event_ts desc);
+create index if not exists idx_fills_side_ts on public.text_fills (side, event_ts desc);
+
 create table if not exists public.text_trades (
   trade_id text primary key,
   run_id text not null references public.text_runs(run_id) on delete cascade,
@@ -149,6 +166,7 @@ for each row execute function public.set_updated_at();
 alter table public.text_runs enable row level security;
 alter table public.text_run_configs enable row level security;
 alter table public.text_run_events enable row level security;
+alter table public.text_fills enable row level security;
 alter table public.text_trades enable row level security;
 alter table public.text_run_reports enable row level security;
 alter table public.text_system_event_logs enable row level security;
@@ -167,6 +185,10 @@ for all to service_role using (true) with check (true);
 
 drop policy if exists run_events_service_role_all on public.text_run_events;
 create policy run_events_service_role_all on public.text_run_events
+for all to service_role using (true) with check (true);
+
+drop policy if exists fills_service_role_all on public.text_fills;
+create policy fills_service_role_all on public.text_fills
 for all to service_role using (true) with check (true);
 
 drop policy if exists trades_service_role_all on public.text_trades;
@@ -199,6 +221,10 @@ drop policy if exists trades_authenticated_select on public.text_trades;
 create policy trades_authenticated_select on public.text_trades
 for select to authenticated using (true);
 
+drop policy if exists fills_authenticated_select on public.text_fills;
+create policy fills_authenticated_select on public.text_fills
+for select to authenticated using (true);
+
 drop policy if exists run_reports_authenticated_select on public.text_run_reports;
 create policy run_reports_authenticated_select on public.text_run_reports
 for select to authenticated using (true);
@@ -208,12 +234,14 @@ grant usage on schema public to service_role;
 grant select, insert, update, delete on table public.text_runs to service_role;
 grant select, insert, update, delete on table public.text_run_configs to service_role;
 grant select, insert, update, delete on table public.text_run_events to service_role;
+grant select, insert, update, delete on table public.text_fills to service_role;
 grant select, insert, update, delete on table public.text_trades to service_role;
 grant select, insert, update, delete on table public.text_run_reports to service_role;
 grant select, insert, update, delete on table public.text_system_event_logs to service_role;
 grant select, insert, update, delete on table public.text_run_event_checkpoints to service_role;
 grant select, insert, update, delete on table public.text_dead_letter_events to service_role;
 grant usage, select on sequence public.text_run_events_id_seq to service_role;
+grant usage, select on sequence public.text_fills_id_seq to service_role;
 grant usage, select on sequence public.text_system_event_logs_id_seq to service_role;
 grant usage, select on sequence public.text_dead_letter_events_id_seq to service_role;
 

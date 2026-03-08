@@ -232,3 +232,115 @@ sequenceDiagram
       end
     end
 ```
+
+## E. Candle Time Integrity Notes
+- `payload.candle.time` for 1m engine candles must be the minute bucket start in Unix seconds.
+- Upbit REST snapshot candles must derive their bucket from `candle_date_time_utc`. The REST `timestamp` field is not the candle identity.
+- Startup snapshot backfill must be cancellable. If startup timeout fires, the unfinished snapshot task must not mutate live `candleState` after WS live processing begins.
+- Live WS processing must drop a closed candle if its candle time lags the triggering trade time by an abnormal amount. This guard exists to block corrupted historical state from triggering fills.
+
+## F. Execution Sequence SSOT
+- Canonical execution event order is defined in `apps/api/src/modules/execution/engine/execution-sequence.ts`.
+- Strategy evaluation and realtime engine paths must reuse this module instead of rebuilding `ORDER_INTENT/FILL/POSITION_UPDATE` arrays independently.
+- Entry sequence: `SIGNAL_EMIT -> ORDER_INTENT -> FILL -> POSITION_UPDATE`
+- Exit sequence: `EXIT -> ORDER_INTENT -> FILL -> POSITION_UPDATE`
+- STRAT_B semi-auto approval sequence: `SIGNAL_EMIT -> APPROVE_ENTER`, then approved execution `ORDER_INTENT -> FILL -> POSITION_UPDATE`
+
+## G. Realtime Engine Module Boundary
+- `apps/api/src/modules/execution/engine/upbit-realtime-engine.ts` is the realtime orchestrator. It owns websocket lifecycle, startup snapshot bootstrap, and event fan-out.
+- `apps/api/src/modules/execution/engine/realtime-candle-state.ts` is the SSOT for minute candle state transitions:
+  - live trade -> current minute candle
+  - bucket rollover -> closed candle
+  - snapshot candle -> minute bucket identity
+- `apps/api/src/modules/execution/engine/strategy-runtime-processor.ts` is the SSOT for closed-candle strategy runtime transitions:
+  - closed candle evaluation
+  - semi-auto approval wait/execute path
+  - risk block and pause emission
+  - readiness event emission
+- `apps/api/src/modules/execution/engine/strategy-runtime-state.ts` owns per-strategy runtime boot state such as `runId`, momentum state, risk state, and pending semi-auto entry.
+- Any future realtime change must preserve this direction:
+  - websocket/data ingest -> candle state helper
+  - closed candle -> runtime processor
+  - emitted decisions/events -> gateway/persistence
+
+## H. Runtime Mode State Machine SSOT
+- `apps/api/src/modules/execution/engine/strategy-runtime-mode-machine.ts` is the SSOT for mode-specific runtime transitions.
+- Runtime lifecycle states are:
+  - `FLAT`
+  - `WAITING_APPROVAL`
+  - `IN_POSITION`
+- Current mode rules:
+  - `SEMI_AUTO`: entry signal requests approval and moves runtime to `WAITING_APPROVAL`
+  - `SEMI_AUTO`: consumed approval triggers approved next-open entry and moves runtime to `IN_POSITION`
+  - `PAPER`, `AUTO`, `LIVE`: executable entry intent follows the direct-entry path, then risk guards decide whether execution continues
+- `apps/api/src/modules/execution/engine/strategy-runtime-state.ts` owns lifecycle sync between runtime data (`strategyState`, `pendingSemiAutoEntry`) and the explicit lifecycle state.
+
+## I. Realtime Network Recovery SSOT
+- `apps/api/src/modules/execution/engine/upbit-realtime-connection.ts` is the SSOT for Upbit websocket lifecycle and recovery behavior.
+- This helper owns:
+  - websocket construction
+  - open/message/error/close listener binding
+  - trade-stream subscription payload
+  - reconnect backoff scheduling
+  - health-check timer logging
+  - reconnect recovery metric updates
+- `apps/api/src/modules/execution/engine/upbit-realtime-engine.ts` must treat this helper as the only owner of websocket connection state and timers.
+- Required recovery behavior:
+  - open -> subscribe trade stream
+  - close without owner stop -> schedule reconnect
+  - reconnect success -> mark recovery metric
+  - owner stop/destroy -> clear timers and suppress reconnect scheduling
+
+## J. Runtime Realtime Status SSOT
+- `apps/api/src/modules/runs/runs.service.ts` is the SSOT for the runtime-facing `realtimeStatus` view attached to each run.
+- `realtimeStatus.connectionState` must be derived in this priority order:
+  1. transport state (`RECONNECTING`, `PAUSED`, `ERROR`)
+  2. startup snapshot delay
+  3. persistence backlog depth
+  4. stale last-event age threshold
+  5. `LIVE`
+- `lastEventAt` is updated from accepted runtime events, not from UI polling.
+- `staleThresholdMs` is emitted with the DTO so clients can explain why a run is delayed.
+
+## K. Persistence Recovery SSOT
+- `apps/api/src/modules/ws/gateways/run-event-persistence-buffer.ts` is the SSOT for DB write failure buffering and ordered flush recovery.
+- Required behavior:
+  - accepted runtime events are still ingested into in-memory runtime state immediately
+  - subscriber publish happens only after DB persistence succeeds
+  - DB failure enqueues the event per run and schedules exponential-backoff retry
+  - queued events flush in original arrival order for that run
+  - backlog depth and retry metadata feed `RunsService.setPersistenceBacklog`
+- `apps/api/src/modules/ws/gateways/realtime.gateway.ts` must treat this helper as the only owner of persistence retry timers and buffered queue state.
+
+## L. Snapshot Recovery Rule
+- Startup snapshot loading may finish normally, fail, or time out.
+- If snapshot loading times out, runtime runs stay in delayed status until the first valid live trade is processed.
+- The first valid live trade clears the snapshot delay flag for all runtime strategies and live processing becomes the source of truth.
+
+## M. Fill Ledger Persistence SSOT
+- `public.text_run_events` remains the raw event log for debugging, replay, and run-level event history.
+- `public.text_fills` is the persisted source of truth for strategy fill history and strategy account summary.
+- `apps/api/src/infra/db/supabase/client/supabase.client.ts` must persist a valid `FILL` into both stores in one retryable operation:
+  1. `text_run_events`
+  2. `text_fills`
+- Duplicate `(run_id, seq)` on `text_run_events` must not prevent a retry from inserting the missing `text_fills` row.
+- `apps/api/src/modules/runs/runs.service.ts` must read persisted fills from `text_fills`, then merge runtime-retained fills by `runId:seq`.
+- Rollout order for existing environments:
+  1. apply the `text_fills` schema
+  2. backfill historical `FILL` rows from `text_run_events`
+  3. deploy the app code that reads from `text_fills`
+- `apps/api/src/modules/runs/runs.service.ts` must derive strategy holdings from merged fill history, then mark open positions to the latest retained strategy candle close when one is available.
+- Account summary fields split into:
+  - fill-driven: `positionQty`, `avgEntryPriceKrw`, `realizedPnlKrw`, `fillCount`
+  - mark-to-market: `markPriceKrw`, `marketValueKrw`, `equityKrw`, `unrealizedPnlKrw`, `totalPnlKrw`, `totalPnlPct`
+
+## N. Position Sizing SSOT
+- `apps/api/src/common/trading-risk.ts` is the SSOT for runtime risk snapshot resolution and entry sizing defaults.
+- `apps/api/src/modules/execution/engine/strategy-runtime-processor.ts` is responsible for converting strategy entry/exit intent into sized execution payloads.
+- BUY sizing sequence:
+  1. resolve account base KRW from latest strategy equity when available
+  2. fall back to `seedKrw` when no account history exists yet
+  3. compute target notional = `accountBaseKrw * maxPositionRatio`
+  4. compute qty = `floor(targetNotional / fillPrice, 8 decimals)`
+- SELL sizing must reuse the open runtime position qty.
+- Strategy readiness scoring and signal generation stay qty-agnostic; sizing happens only inside the execution path after risk checks pass.

@@ -5,6 +5,7 @@ import {
   HistogramSeries,
   LineSeries,
   LineStyle,
+  TickMarkType,
   createChart,
   createSeriesMarkers,
   type IChartApi,
@@ -13,8 +14,10 @@ import {
   type LineWidth,
   type MouseEventParams,
   type SeriesMarker,
+  type Time,
   type UTCTimestamp
 } from 'lightweight-charts';
+import { UI_COLOR } from '../ui/color-semantic';
 
 const { Text } = Typography;
 
@@ -91,6 +94,120 @@ const TIMEFRAME_OPTIONS: ReadonlyArray<Readonly<{ key: TimeframeKey; label: stri
   { key: '4h', label: '4시간', minutes: 240 },
   { key: '1d', label: '1일', minutes: 1440 }
 ];
+
+const KST_TIME_ZONE = 'Asia/Seoul';
+const KST_LOCALE = 'ko-KR';
+const KST_PARTS_FORMATTER = new Intl.DateTimeFormat('en-CA', {
+  timeZone: KST_TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false
+});
+
+type KstDateParts = Readonly<{
+  year: string;
+  month: string;
+  day: string;
+  hour: string;
+  minute: string;
+  second: string;
+}>;
+
+function toChartDate(time: Time): Date | undefined {
+  if (typeof time === 'number') {
+    return new Date(time * 1000);
+  }
+
+  if (typeof time === 'string') {
+    const parsed = Date.parse(time);
+    return Number.isFinite(parsed) ? new Date(parsed) : undefined;
+  }
+
+  if (
+    typeof time === 'object' &&
+    time !== null &&
+    'year' in time &&
+    'month' in time &&
+    'day' in time &&
+    typeof time.year === 'number' &&
+    typeof time.month === 'number' &&
+    typeof time.day === 'number'
+  ) {
+    return new Date(Date.UTC(time.year, time.month - 1, time.day));
+  }
+
+  return undefined;
+}
+
+function toKstDateParts(time: Time): KstDateParts | undefined {
+  const date = toChartDate(time);
+  if (!date) {
+    return undefined;
+  }
+
+  const partMap = KST_PARTS_FORMATTER
+    .formatToParts(date)
+    .reduce<Record<string, string>>((acc, part) => {
+      if (part.type !== 'literal') {
+        acc[part.type] = part.value;
+      }
+      return acc;
+    }, {});
+
+  if (
+    !partMap.year ||
+    !partMap.month ||
+    !partMap.day ||
+    !partMap.hour ||
+    !partMap.minute ||
+    !partMap.second
+  ) {
+    return undefined;
+  }
+
+  return {
+    year: partMap.year,
+    month: partMap.month,
+    day: partMap.day,
+    hour: partMap.hour,
+    minute: partMap.minute,
+    second: partMap.second
+  };
+}
+
+function formatKstCrosshairTime(time: Time): string {
+  const parts = toKstDateParts(time);
+  if (!parts) {
+    return '';
+  }
+
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute} KST`;
+}
+
+function formatKstTickMark(time: Time, tickMarkType: TickMarkType): string | null {
+  const parts = toKstDateParts(time);
+  if (!parts) {
+    return null;
+  }
+
+  switch (tickMarkType) {
+    case TickMarkType.Year:
+      return parts.year;
+    case TickMarkType.Month:
+      return `${parts.year.slice(-2)}-${parts.month}`;
+    case TickMarkType.DayOfMonth:
+      return `${parts.month}/${parts.day}`;
+    case TickMarkType.TimeWithSeconds:
+      return `${parts.hour}:${parts.minute}:${parts.second}`;
+    case TickMarkType.Time:
+    default:
+      return `${parts.hour}:${parts.minute}`;
+  }
+}
 
 function timeframeMinutes(key: TimeframeKey): number {
   const found = TIMEFRAME_OPTIONS.find((item) => item.key === key);
@@ -340,25 +457,32 @@ export function ChartPanel({ candles, overlays = [], markers = [] }: ChartPanelP
     const chart = createChart(el, {
       width: el.clientWidth,
       height: 360,
+      localization: {
+        locale: KST_LOCALE,
+        dateFormat: 'yyyy-MM-dd',
+        timeFormatter: formatKstCrosshairTime
+      },
       layout: {
-        textColor: '#1f2937',
-        background: { color: '#ffffff' }
+        textColor: UI_COLOR.neutral.text,
+        background: { color: UI_COLOR.neutral.surface }
       },
       grid: {
         vertLines: { color: '#edf2f7' },
         horzLines: { color: '#edf2f7' }
       },
       rightPriceScale: {
-        borderColor: '#d6deea',
+        borderColor: UI_COLOR.neutral.border,
         scaleMargins: {
           top: 0.05,
           bottom: 0.23
         }
       },
       timeScale: {
-        borderColor: '#d6deea',
+        borderColor: UI_COLOR.neutral.border,
         timeVisible: true,
-        secondsVisible: false
+        secondsVisible: false,
+        tickMarkFormatter: (time: Time, tickMarkType: TickMarkType) =>
+          formatKstTickMark(time, tickMarkType)
       },
       crosshair: {
         vertLine: { color: '#94a3b8', labelBackgroundColor: '#111827' },
@@ -376,7 +500,7 @@ export function ChartPanel({ candles, overlays = [], markers = [] }: ChartPanelP
     });
 
     const lineSeries = chart.addSeries(LineSeries, {
-      color: '#2563eb',
+      color: UI_COLOR.status.info,
       lineWidth: 2,
       crosshairMarkerVisible: true,
       crosshairMarkerRadius: 4,
@@ -553,7 +677,7 @@ export function ChartPanel({ candles, overlays = [], markers = [] }: ChartPanelP
 
     const nextDrawingSeries = drawings.map((drawing) => {
       const series = chart.addSeries(LineSeries, {
-        color: '#111827',
+        color: UI_COLOR.neutral.text,
         lineWidth: 2,
         lineStyle: LineStyle.Solid,
         crosshairMarkerVisible: false,
@@ -590,9 +714,9 @@ export function ChartPanel({ candles, overlays = [], markers = [] }: ChartPanelP
     <div
       style={{
         width: '100%',
-        border: '1px solid #d6deea',
+        border: `1px solid ${UI_COLOR.neutral.border}`,
         borderRadius: 8,
-        background: '#ffffff',
+        background: UI_COLOR.neutral.surface,
         padding: 8
       }}
     >
@@ -684,7 +808,7 @@ export function ChartPanel({ candles, overlays = [], markers = [] }: ChartPanelP
           </Flex>
 
           {pendingTrendStart ? (
-            <Text style={{ display: 'block', marginBottom: 6, color: '#b45309' }}>
+            <Text style={{ display: 'block', marginBottom: 6, color: UI_COLOR.status.warning }}>
               추세선 시작점이 선택되었습니다. 두 번째 점을 클릭해 선을 완성하세요.
             </Text>
           ) : null}

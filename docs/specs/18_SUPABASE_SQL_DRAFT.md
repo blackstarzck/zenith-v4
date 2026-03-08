@@ -267,3 +267,28 @@ using (true);
 5. checkpoint/dead-letter 테이블 추가(선택)
 6. 백엔드 repository/DTO 연결
 7. run 저장 E2E 테스트 수행(중복/역순/타임아웃 케이스 포함)
+
+# Fill ledger SQL addendum (ASCII appendix)
+```sql
+create table if not exists text_fills (
+  id bigserial primary key,
+  run_id text not null references text_runs(run_id) on delete cascade,
+  seq bigint not null,
+  event_ts timestamptz not null,
+  trace_id text not null,
+  side text not null check (side in ('BUY', 'SELL')),
+  qty numeric(28,12) not null,
+  fill_price numeric(20,8) not null,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  unique (run_id, seq)
+);
+
+create index if not exists idx_fills_run_ts
+  on text_fills (run_id, event_ts desc);
+create index if not exists idx_fills_side_ts
+  on text_fills (side, event_ts desc);
+```
+
+- Backfill for existing environments should insert valid legacy `FILL` rows from `text_run_events` into `text_fills` with `on conflict (run_id, seq) do nothing`.
+- Deploy order: schema first, backfill second, app read-path switch last.

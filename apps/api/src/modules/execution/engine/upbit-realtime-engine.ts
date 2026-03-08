@@ -1,4 +1,8 @@
-import type { WsEventEnvelopeDto } from '@zenith/contracts';
+import {
+  SYSTEM_EVENT_TYPE,
+  type ConnectionState,
+  type WsEventEnvelopeDto
+} from '@zenith/contracts';
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { SystemEventLogger } from '../../observability/system-events/system-event.logger';
 import { RuntimeMetricsService } from '../../observability/runtime-metrics.service';
@@ -6,12 +10,22 @@ import { RunsService } from '../../runs/runs.service';
 import { RealtimeGateway } from '../../ws/gateways/realtime.gateway';
 import { UpbitMarketClient, type UpbitMinuteCandleDto } from '../upbit.market.client';
 import {
-  INITIAL_MOMENTUM_STATE,
-  type MomentumState
-} from './simple-momentum.strategy';
-import { resolveStrategyConfig } from './strategy-config';
-import { evaluateStrategyCandle } from './strategy-evaluator';
-import { evaluateEntryBlock, initialRiskState, onEntryAccepted, onExitPnl, type RiskState } from './risk-guard';
+  isStaleClosedCandle,
+  resolveSnapshotBucketMs,
+  snapshotToCandleState,
+  toRuntimeCandle,
+  updateOneMinuteCandle,
+  type CandleState,
+  type RuntimeCandle
+} from './realtime-candle-state';
+import { StrategyRuntimeProcessor } from './strategy-runtime-processor';
+import { type StrategyId } from './strategy-config';
+import {
+  createStrategyRuntimeState,
+  STRATEGY_IDS,
+  type StrategyRuntimeState
+} from './strategy-runtime-state';
+import { UpbitRealtimeConnection } from './upbit-realtime-connection';
 
 type UpbitTradeMessage = Readonly<{
   code?: string;
@@ -22,47 +36,13 @@ type UpbitTradeMessage = Readonly<{
   timestamp?: number;
   trade_timestamp?: number;
 }>;
-
-type CandleState = Readonly<{
-  bucketMs: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume: number;
-}>;
-
-type CandleUpdateResult = Readonly<{
-  current: Readonly<{
-    time: number;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-  }>;
-  closed?: Readonly<{
-    time: number;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-  }>;
-}>;
-
-type PendingSemiAutoEntry = Readonly<{
-  signalTime: number;
-  suggestedPrice: number;
-}>;
+const MAX_CLOSED_CANDLE_LAG_MS = 10 * 60_000;
 
 @Injectable()
 export class UpbitRealtimeEngine implements OnModuleInit, OnModuleDestroy {
-  private readonly runId = 'run-dev-0001';
   private readonly market = process.env.UPBIT_MARKET ?? 'KRW-XRP';
   private readonly mode = (process.env.RUN_MODE as 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE' | undefined) ?? 'PAPER';
   private readonly wsUrl = 'wss://api.upbit.com/websocket/v1';
-  private readonly strategy = resolveStrategyConfig(process.env.STRATEGY_ID);
   private readonly strategyVersion = process.env.STRATEGY_VERSION ?? 'v1';
   private readonly allowLiveTrading = process.env.ALLOW_LIVE_TRADING === 'true';
   private readonly e2eForceSemiAutoSignal = process.env.E2E_FORCE_SEMI_AUTO_SIGNAL === 'true';
@@ -71,18 +51,15 @@ export class UpbitRealtimeEngine implements OnModuleInit, OnModuleDestroy {
   private readonly riskMaxDailyOrders = Number(process.env.RISK_MAX_DAILY_ORDERS ?? '200');
   private readonly riskKillSwitchEnabled = process.env.RISK_KILL_SWITCH !== 'false';
 
-  private ws: WebSocket | undefined;
-  private reconnectTimer: NodeJS.Timeout | undefined;
-  private connectionHealthTimer: NodeJS.Timeout | undefined;
-  private reconnectScheduledAtMs: number | undefined;
-  private lastMessageAtMs: number | undefined;
-  private seq = 0;
-  private reconnectAttempt = 0;
-  private closedByModuleDestroy = false;
   private candleState: CandleState | undefined;
-  private strategyState: MomentumState = INITIAL_MOMENTUM_STATE;
-  private pendingSemiAutoEntry: PendingSemiAutoEntry | undefined;
-  private riskState: RiskState = initialRiskState(Date.now());
+  private snapshotRecoveryPending = false;
+  private readonly connection: UpbitRealtimeConnection;
+  private readonly runtimeProcessor: StrategyRuntimeProcessor;
+  private readonly runtimeByStrategy: Record<StrategyId, StrategyRuntimeState> = {
+    STRAT_A: createStrategyRuntimeState('STRAT_A', this.strategyVersion),
+    STRAT_B: createStrategyRuntimeState('STRAT_B', this.strategyVersion),
+    STRAT_C: createStrategyRuntimeState('STRAT_C', this.strategyVersion)
+  };
 
   constructor(
     private readonly gateway: RealtimeGateway,
@@ -90,164 +67,65 @@ export class UpbitRealtimeEngine implements OnModuleInit, OnModuleDestroy {
     private readonly metrics: RuntimeMetricsService,
     private readonly runsService: RunsService,
     private readonly upbitClient: UpbitMarketClient
-  ) {}
+  ) {
+    this.runtimeProcessor = new StrategyRuntimeProcessor({
+      mode: this.mode,
+      allowLiveTrading: this.allowLiveTrading,
+      e2eForceSemiAutoSignal: this.e2eForceSemiAutoSignal,
+      riskConfig: {
+        dailyLossLimitPct: this.riskDailyLossLimitPct,
+        maxConsecutiveLosses: this.riskMaxConsecutiveLosses,
+        maxDailyOrders: this.riskMaxDailyOrders,
+        killSwitchEnabled: this.riskKillSwitchEnabled
+      },
+      consumeApproval: (runId) => this.runsService.consumeApproval(runId),
+      resolveAccountBaseKrw: async (runtime) => {
+        const summary = await this.runsService.getStrategyAccountSummary(runtime.strategyId);
+        return summary.equityKrw;
+      },
+      emitStrategyEvent: (runtime, eventType, eventTsMs, candle, payload) => (
+        this.emitStrategyEvent(runtime, eventType, eventTsMs, candle, payload)
+      )
+    });
+    this.connection = new UpbitRealtimeConnection({
+      wsUrl: this.wsUrl,
+      market: this.market,
+      logger: this.logger,
+      metrics: this.metrics,
+      getRunId: () => this.primaryRunId(),
+      onMessage: (raw) => this.handleUpbitMessage(raw),
+      onStateChange: (input) => this.applyTransportStateToAllRuns(input)
+    });
+  }
 
   async onModuleInit(): Promise<void> {
-    await this.runsService.restoreRun(this.runId);
-    this.runsService.seedRun(this.runId, {
-      strategyId: this.strategy.strategyId,
-      strategyVersion: this.strategyVersion,
-      mode: this.mode,
-      market: this.market
-    });
-    this.seq = this.runsService.getLastSeq(this.runId);
-    await this.bootstrapMinuteCandlesWithTimeout();
-    this.connect();
-    this.startConnectionHealthMonitor();
+    for (const strategyId of STRATEGY_IDS) {
+      const runtime = this.runtimeByStrategy[strategyId];
+      await this.runsService.restoreRun(runtime.runId);
+      this.runsService.seedRun(runtime.runId, {
+        strategyId: runtime.strategyId,
+        strategyVersion: this.strategyVersion,
+        mode: this.mode,
+        market: this.market
+      });
+      runtime.seq = this.runsService.getLastSeq(runtime.runId);
+      await this.hydrateRuntimeRecentCandles(runtime);
+      this.runsService.setSnapshotDelay(runtime.runId, true);
+    }
+    const snapshotLoaded = await this.bootstrapMinuteCandlesWithTimeout();
+    this.snapshotRecoveryPending = !snapshotLoaded;
+    if (snapshotLoaded) {
+      this.markAllRunsSnapshotDelay(false);
+    }
+    this.connection.start();
   }
 
   onModuleDestroy(): void {
-    this.closedByModuleDestroy = true;
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = undefined;
-    }
-    if (this.connectionHealthTimer) {
-      clearInterval(this.connectionHealthTimer);
-      this.connectionHealthTimer = undefined;
-    }
-    this.ws?.close();
-    this.ws = undefined;
+    this.connection.stop();
   }
 
   forceReconnectForTest(): Readonly<{ ok: boolean; reason?: string }> {
-    if (!this.ws) {
-      return { ok: false, reason: 'WS_UNINITIALIZED' };
-    }
-    this.ws.close();
-    return { ok: true };
-  }
-
-  private connect(): void {
-    try {
-      this.ws = new WebSocket(this.wsUrl);
-    } catch (error: unknown) {
-      this.logger.error('Failed to construct Upbit websocket client', {
-        source: 'modules.execution.upbitRealtime.connect',
-        runId: this.runId,
-        payload: { reason: error instanceof Error ? error.message : 'unknown' }
-      });
-      this.scheduleReconnect();
-      return;
-    }
-
-    this.ws.addEventListener('open', () => {
-      if (typeof this.reconnectScheduledAtMs === 'number') {
-        this.metrics.markUpbitReconnectRecovered(Date.now() - this.reconnectScheduledAtMs);
-        this.reconnectScheduledAtMs = undefined;
-      }
-      this.reconnectAttempt = 0;
-      this.lastMessageAtMs = Date.now();
-      this.logger.info('Upbit websocket connected', {
-        source: 'modules.execution.upbitRealtime.open',
-        runId: this.runId,
-        payload: { market: this.market }
-      });
-      this.subscribeTradeStream();
-    });
-
-    this.ws.addEventListener('message', (event) => {
-      this.lastMessageAtMs = Date.now();
-      void this.handleUpbitMessage(event.data);
-    });
-
-    this.ws.addEventListener('error', (event) => {
-      this.logger.warn('Upbit websocket error event', {
-        source: 'modules.execution.upbitRealtime.error',
-        runId: this.runId,
-        payload: { message: String((event as { message?: string }).message ?? 'unknown') }
-      });
-    });
-
-    this.ws.addEventListener('close', () => {
-      this.logger.warn('Upbit websocket closed', {
-        source: 'modules.execution.upbitRealtime.close',
-        runId: this.runId,
-        payload: { market: this.market, closedByModuleDestroy: this.closedByModuleDestroy }
-      });
-      this.ws = undefined;
-      if (!this.closedByModuleDestroy) {
-        this.scheduleReconnect();
-      }
-    });
-  }
-
-  private subscribeTradeStream(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    const payload = JSON.stringify([
-      { ticket: `zenith-${this.runId}` },
-      { type: 'trade', codes: [this.market], isOnlyRealtime: true }
-    ]);
-
-    this.ws.send(payload);
-  }
-
-  private scheduleReconnect(): void {
-    if (this.reconnectTimer || this.closedByModuleDestroy) {
-      return;
-    }
-
-    this.reconnectAttempt += 1;
-    const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(this.reconnectAttempt, 5));
-    this.reconnectScheduledAtMs = Date.now();
-    this.metrics.markUpbitReconnectAttempt();
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = undefined;
-      this.connect();
-    }, delayMs);
-
-    this.logger.warn('Scheduled Upbit websocket reconnect', {
-      source: 'modules.execution.upbitRealtime.scheduleReconnect',
-      runId: this.runId,
-      payload: { reconnectAttempt: this.reconnectAttempt, delayMs }
-    });
-  }
-
-  private startConnectionHealthMonitor(): void {
-    const intervalMs = 10 * 60_000;
-    this.connectionHealthTimer = setInterval(() => {
-      const wsReadyState = this.ws?.readyState;
-      this.logger.info('Upbit websocket health check', {
-        source: 'modules.execution.upbitRealtime.health',
-        runId: this.runId,
-        payload: {
-          market: this.market,
-          connected: wsReadyState === WebSocket.OPEN,
-          readyState: this.toReadyStateLabel(wsReadyState),
-          reconnectAttempt: this.reconnectAttempt,
-          lastMessageAgeMs: typeof this.lastMessageAtMs === 'number' ? Date.now() - this.lastMessageAtMs : null
-        }
-      });
-    }, intervalMs);
-  }
-
-  private toReadyStateLabel(state: number | undefined): string {
-    if (state === WebSocket.CONNECTING) {
-      return 'CONNECTING';
-    }
-    if (state === WebSocket.OPEN) {
-      return 'OPEN';
-    }
-    if (state === WebSocket.CLOSING) {
-      return 'CLOSING';
-    }
-    if (state === WebSocket.CLOSED) {
-      return 'CLOSED';
-    }
-    return 'UNINITIALIZED';
+    return this.connection.forceReconnectForTest();
   }
 
   private async handleUpbitMessage(raw: unknown): Promise<void> {
@@ -260,32 +138,54 @@ export class UpbitRealtimeEngine implements OnModuleInit, OnModuleDestroy {
       }
 
       const tradeTsMs = trade.trade_timestamp ?? trade.timestamp ?? Date.now();
-      const candleUpdate = this.updateOneMinuteCandle(tradeTsMs, trade.trade_price, trade.trade_volume ?? 0);
+      const candleUpdate = updateOneMinuteCandle(this.candleState, tradeTsMs, trade.trade_price, trade.trade_volume ?? 0);
+      this.candleState = candleUpdate.nextState;
+      this.clearSnapshotDelayAfterLiveTrade();
 
-      const event: WsEventEnvelopeDto = {
-        runId: this.runId,
-        seq: this.nextSeq(),
-        traceId: crypto.randomUUID(),
-        eventType: 'MARKET_TICK',
-        eventTs: new Date(tradeTsMs).toISOString(),
-        payload: {
-          market: trade.code,
-          tradePrice: trade.trade_price,
-          tradeVolume: trade.trade_volume ?? 0,
-          askBid: trade.ask_bid ?? 'UNKNOWN',
-          change: trade.change ?? 'UNKNOWN',
-          candle: candleUpdate.current
-        }
-      };
+      for (const strategyId of STRATEGY_IDS) {
+        const runtime = this.runtimeByStrategy[strategyId];
+        const event: WsEventEnvelopeDto = {
+          runId: runtime.runId,
+          seq: this.nextSeq(runtime),
+          traceId: crypto.randomUUID(),
+          eventType: 'MARKET_TICK',
+          eventTs: new Date(tradeTsMs).toISOString(),
+          payload: {
+            market: trade.code,
+            strategyId: runtime.strategyId,
+            strategyVersion: this.strategyVersion,
+            strategyName: runtime.strategyName,
+            tradePrice: trade.trade_price,
+            tradeVolume: trade.trade_volume ?? 0,
+            askBid: trade.ask_bid ?? 'UNKNOWN',
+            change: trade.change ?? 'UNKNOWN',
+            candle: candleUpdate.current
+          }
+        };
 
-      await this.gateway.ingestEngineEvent(event);
+        await this.gateway.ingestEngineEvent(event);
+      }
       if (candleUpdate.closed) {
+        if (isStaleClosedCandle(candleUpdate.closed.time, tradeTsMs, MAX_CLOSED_CANDLE_LAG_MS)) {
+          this.logger.warn('Skipped stale closed candle during live processing', {
+            source: 'modules.execution.upbitRealtime.handleMessage',
+            eventType: SYSTEM_EVENT_TYPE.ENGINE_STATE_INVALID,
+            runId: this.primaryRunId(),
+            payload: {
+              closedTime: candleUpdate.closed.time,
+              closedTs: new Date(candleUpdate.closed.time * 1000).toISOString(),
+              tradeTs: new Date(tradeTsMs).toISOString(),
+              lagMs: tradeTsMs - candleUpdate.closed.time * 1000
+            }
+          });
+          return;
+        }
         await this.processClosedCandle(candleUpdate.closed, tradeTsMs);
       }
     } catch (error: unknown) {
       this.logger.warn('Failed to decode/process Upbit message', {
         source: 'modules.execution.upbitRealtime.handleMessage',
-        runId: this.runId,
+        runId: this.primaryRunId(),
         payload: {
           reason: error instanceof Error ? error.message : 'unknown',
           rawLength: decoded.length
@@ -310,337 +210,232 @@ export class UpbitRealtimeEngine implements OnModuleInit, OnModuleDestroy {
     return '';
   }
 
-  private updateOneMinuteCandle(tradeTsMs: number, price: number, tradeVolume: number): CandleUpdateResult {
-    const bucketMs = Math.floor(tradeTsMs / 60_000) * 60_000;
-    const prev = this.candleState;
-    let closed:
-      | Readonly<{
-          time: number;
-          open: number;
-          high: number;
-          low: number;
-          close: number;
-          volume: number;
-        }>
-      | undefined;
-    if (!prev || prev.bucketMs !== bucketMs) {
-      if (prev) {
-        closed = {
-          time: Math.floor(prev.bucketMs / 1000),
-          open: prev.open,
-          high: prev.high,
-          low: prev.low,
-          close: prev.close,
-          volume: prev.volume
-        };
-      }
-      this.candleState = { bucketMs, open: price, high: price, low: price, close: price, volume: tradeVolume };
-    } else {
-      this.candleState = {
-        bucketMs,
-        open: prev.open,
-        high: Math.max(prev.high, price),
-        low: Math.min(prev.low, price),
-        close: price,
-        volume: prev.volume + tradeVolume
-      };
+  private async processClosedCandle(candle: RuntimeCandle, eventTsMs: number): Promise<void> {
+    for (const strategyId of STRATEGY_IDS) {
+      const runtime = this.runtimeByStrategy[strategyId];
+      await this.processClosedCandleForStrategy(runtime, candle, eventTsMs);
     }
-
-    const candle = this.candleState;
-    const current = {
-      time: Math.floor(candle.bucketMs / 1000),
-      open: candle.open,
-      high: candle.high,
-      low: candle.low,
-      close: candle.close,
-      volume: candle.volume
-    };
-    if (closed) {
-      return { current, closed };
-    }
-    return {
-      current
-    };
   }
 
-  private async processClosedCandle(
-    candle: Readonly<{
-      time: number;
-      open: number;
-      high: number;
-      low: number;
-      close: number;
-    }>,
+  private async processClosedCandleForStrategy(
+    runtime: StrategyRuntimeState,
+    candle: RuntimeCandle,
     eventTsMs: number
   ): Promise<void> {
-    if (this.mode === 'SEMI_AUTO' && this.pendingSemiAutoEntry) {
-      if (!this.runsService.consumeApproval(this.runId)) {
-        return;
-      }
-      await this.emitSemiAutoApprovedEntry(candle, eventTsMs);
-      return;
-    }
-
-    if (this.mode === 'SEMI_AUTO' && this.e2eForceSemiAutoSignal && !this.strategyState.inPosition) {
-      await this.emitStrategyEvent('SIGNAL_EMIT', eventTsMs, candle, {
-        signal: 'LONG_ENTRY',
-        reason: 'E2E_FORCE_SEMI_AUTO_SIGNAL'
-      });
-      await this.emitStrategyEvent('APPROVE_ENTER', eventTsMs, candle, {
-        approvalMode: 'SEMI_AUTO',
-        entryPolicy: 'NEXT_OPEN_AFTER_APPROVAL',
-        suggestedPrice: candle.close
-      });
-      this.pendingSemiAutoEntry = {
-        signalTime: candle.time,
-        suggestedPrice: candle.close
-      };
-      return;
-    }
-
-    const result = evaluateStrategyCandle(this.strategy.strategyId, this.strategyState, candle, this.strategy.momentum);
-
-    const isEntrySignal = result.decisions.some((decision) => decision.eventType === 'SIGNAL_EMIT');
-    if (this.mode === 'SEMI_AUTO' && !this.strategyState.inPosition && isEntrySignal) {
-      const signal = result.decisions.find((decision) => decision.eventType === 'SIGNAL_EMIT');
-      if (signal) {
-        await this.emitStrategyEvent('SIGNAL_EMIT', eventTsMs, candle, signal.payload);
-      }
-      await this.emitStrategyEvent('APPROVE_ENTER', eventTsMs, candle, {
-        approvalMode: 'SEMI_AUTO',
-        entryPolicy: 'NEXT_OPEN_AFTER_APPROVAL',
-        suggestedPrice: candle.close
-      });
-      this.pendingSemiAutoEntry = {
-        signalTime: candle.time,
-        suggestedPrice: candle.close
-      };
-      return;
-    }
-
-    if (!this.strategyState.inPosition && this.isEntryDecisions(result.decisions)) {
-      const blockReason = this.evaluateEntryBlockReason(eventTsMs);
-      if (blockReason) {
-        await this.emitRiskBlock(blockReason, eventTsMs, candle);
-        return;
-      }
-      this.incrementDailyOrders(eventTsMs);
-    }
-
-    this.strategyState = result.nextState;
-    for (const decision of result.decisions) {
-      await this.emitStrategyEvent(decision.eventType, eventTsMs, candle, decision.payload);
-      this.trackRiskFromDecision(decision);
-    }
+    await this.runtimeProcessor.processClosedCandle(runtime, candle, eventTsMs);
   }
 
-  private nextSeq(): number {
-    this.seq += 1;
-    return this.seq;
+  private async emitEntryReadiness(
+    runtime: StrategyRuntimeState,
+    eventTsMs: number,
+    candle: RuntimeCandle,
+    payload: Readonly<{
+      entryReadinessPct: number;
+      entryReady: boolean;
+      entryExecutable: boolean;
+      reason: string;
+      inPosition: boolean;
+    }>
+  ): Promise<void> {
+    await this.emitStrategyEvent(runtime, 'ENTRY_READINESS', eventTsMs, candle, payload);
   }
 
-  private async bootstrapMinuteCandles(): Promise<void> {
+  private nextSeq(runtime: StrategyRuntimeState): number {
+    runtime.seq += 1;
+    return runtime.seq;
+  }
+
+  private async hydrateRuntimeRecentCandles(runtime: StrategyRuntimeState): Promise<void> {
+    const candles = await this.runsService.getCandles(runtime.runId, 200);
+    if (!candles || candles.length === 0) {
+      return;
+    }
+
+    runtime.strategyState = {
+      ...runtime.strategyState,
+      recentCandles: candles.slice(-200).map((item) => ({
+        time: item.time,
+        open: item.open,
+        high: item.high,
+        low: item.low,
+        close: item.close
+      }))
+    };
+  }
+
+  private async bootstrapMinuteCandles(isCancelled?: () => boolean): Promise<boolean> {
     try {
       const candles = await this.upbitClient.getMinuteCandles(this.market, 1, 200);
-      const asc = [...candles].sort((a, b) => a.timestamp - b.timestamp);
+      if (isCancelled?.()) {
+        return false;
+      }
+      const asc = [...candles].sort((a, b) => resolveSnapshotBucketMs(a) - resolveSnapshotBucketMs(b));
       for (const candle of asc) {
+        if (isCancelled?.()) {
+          return false;
+        }
         await this.emitSnapshotCandle(candle);
       }
 
+      if (isCancelled?.()) {
+        return false;
+      }
       this.logger.info('Upbit candle snapshot loaded', {
         source: 'modules.execution.upbitRealtime.bootstrapMinuteCandles',
-        runId: this.runId,
+        runId: this.primaryRunId(),
         payload: { market: this.market, count: asc.length }
       });
+      return true;
     } catch (error: unknown) {
       this.logger.warn('Failed to load Upbit candle snapshot', {
         source: 'modules.execution.upbitRealtime.bootstrapMinuteCandles',
-        runId: this.runId,
+        runId: this.primaryRunId(),
         payload: { market: this.market, reason: error instanceof Error ? error.message : 'unknown' }
       });
+      return false;
     }
   }
 
-  private async bootstrapMinuteCandlesWithTimeout(): Promise<void> {
+  private async bootstrapMinuteCandlesWithTimeout(): Promise<boolean> {
     const timeoutMs = 7000;
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-    }, timeoutMs);
+    let cancelled = false;
+    let completed = false;
+    let snapshotLoaded = false;
+    const bootstrapPromise = this.bootstrapMinuteCandles(() => cancelled)
+      .then((loaded) => {
+        snapshotLoaded = loaded;
+      })
+      .finally(() => {
+        completed = true;
+      });
 
     await Promise.race([
-      this.bootstrapMinuteCandles(),
+      bootstrapPromise,
       new Promise<void>((resolve) => {
         setTimeout(resolve, timeoutMs);
       })
     ]);
-    clearTimeout(timer);
 
-    if (timedOut) {
+    if (!completed) {
+      cancelled = true;
+      this.candleState = undefined;
       this.logger.warn('Skipped waiting for candle snapshot due startup timeout', {
         source: 'modules.execution.upbitRealtime.bootstrapMinuteCandlesWithTimeout',
-        runId: this.runId,
+        runId: this.primaryRunId(),
         payload: { timeoutMs, market: this.market }
+      });
+      return false;
+    }
+
+    return snapshotLoaded;
+  }
+
+  private async emitSnapshotCandle(candle: UpbitMinuteCandleDto): Promise<void> {
+    const nextCandleState = snapshotToCandleState(candle);
+    const bucketMs = nextCandleState.bucketMs;
+    if (this.candleState && bucketMs < this.candleState.bucketMs) {
+      this.logger.warn('Ignored stale snapshot candle after live state advanced', {
+        source: 'modules.execution.upbitRealtime.emitSnapshotCandle',
+        eventType: SYSTEM_EVENT_TYPE.ENGINE_STATE_INVALID,
+        runId: this.primaryRunId(),
+        payload: {
+          snapshotBucket: new Date(bucketMs).toISOString(),
+          currentBucket: new Date(this.candleState.bucketMs).toISOString()
+        }
+      });
+      return;
+    }
+    this.candleState = nextCandleState;
+    const runtimeCandle = toRuntimeCandle(nextCandleState);
+
+    for (const strategyId of STRATEGY_IDS) {
+      const runtime = this.runtimeByStrategy[strategyId];
+      await this.gateway.ingestEngineEvent({
+        runId: runtime.runId,
+        seq: this.nextSeq(runtime),
+        traceId: crypto.randomUUID(),
+        eventType: 'MARKET_TICK',
+        eventTs: new Date(bucketMs).toISOString(),
+        payload: {
+          market: this.market,
+          strategyId: runtime.strategyId,
+          strategyVersion: this.strategyVersion,
+          strategyName: runtime.strategyName,
+          source: 'CANDLE_SNAPSHOT',
+          candle: runtimeCandle
+        }
       });
     }
   }
 
-  private async emitSnapshotCandle(candle: UpbitMinuteCandleDto): Promise<void> {
-    this.candleState = {
-      bucketMs: Math.floor(candle.timestamp / 60_000) * 60_000,
-      open: candle.opening_price,
-      high: candle.high_price,
-      low: candle.low_price,
-      close: candle.trade_price,
-      volume: candle.candle_acc_trade_volume ?? 0
-    };
-
-    await this.gateway.ingestEngineEvent({
-      runId: this.runId,
-      seq: this.nextSeq(),
-      traceId: crypto.randomUUID(),
-      eventType: 'MARKET_TICK',
-      eventTs: new Date(candle.timestamp).toISOString(),
-      payload: {
-        market: this.market,
-        source: 'CANDLE_SNAPSHOT',
-        candle: {
-          time: Math.floor(candle.timestamp / 1000),
-          open: candle.opening_price,
-          high: candle.high_price,
-          low: candle.low_price,
-          close: candle.trade_price,
-          volume: candle.candle_acc_trade_volume ?? 0
-        }
-      }
-    });
-  }
-
   private async emitSemiAutoApprovedEntry(
-    candle: Readonly<{
-      time: number;
-      open: number;
-      high: number;
-      low: number;
-      close: number;
-    }>,
+    runtime: StrategyRuntimeState,
+    candle: RuntimeCandle,
     eventTsMs: number
   ): Promise<void> {
-    const blockReason = this.evaluateEntryBlockReason(eventTsMs);
-    if (blockReason) {
-      await this.emitRiskBlock(blockReason, eventTsMs, candle);
-      return;
-    }
-
-    this.incrementDailyOrders(eventTsMs);
-    await this.emitStrategyEvent('ORDER_INTENT', eventTsMs, candle, {
-      side: 'BUY',
-      qty: 1,
-      price: candle.open,
-      reason: 'SEMI_AUTO_NEXT_OPEN'
-    });
-    await this.emitStrategyEvent('FILL', eventTsMs, candle, {
-      side: 'BUY',
-      qty: 1,
-      fillPrice: candle.open
-    });
-    await this.emitStrategyEvent('POSITION_UPDATE', eventTsMs, candle, {
-      side: 'LONG',
-      qty: 1,
-      avgEntry: candle.open
-    });
-
-    this.strategyState = {
-      ...this.strategyState,
-      inPosition: true,
-      entryPrice: candle.open,
-      entryTime: candle.time,
-      barsHeld: 0
-    };
-    this.pendingSemiAutoEntry = undefined;
+    await this.runtimeProcessor.emitSemiAutoApprovedEntry(runtime, candle, eventTsMs);
   }
 
   private async emitStrategyEvent(
+    runtime: StrategyRuntimeState,
     eventType: string,
     eventTsMs: number,
-    candle: Readonly<{
-      time: number;
-      open: number;
-      high: number;
-      low: number;
-      close: number;
-    }>,
+    candle: RuntimeCandle,
     payload: Readonly<Record<string, unknown>>
   ): Promise<void> {
     await this.gateway.ingestEngineEvent({
-      runId: this.runId,
-      seq: this.nextSeq(),
+      runId: runtime.runId,
+      seq: this.nextSeq(runtime),
       traceId: crypto.randomUUID(),
       eventType,
       eventTs: new Date(eventTsMs).toISOString(),
       payload: {
         market: this.market,
         candle,
-        strategyId: this.strategy.strategyId,
+        strategyId: runtime.strategyId,
         strategyVersion: this.strategyVersion,
-        strategyName: this.strategy.strategyName,
+        strategyName: runtime.strategyName,
         ...payload
       }
     });
   }
 
-  private isEntryDecisions(decisions: ReadonlyArray<Readonly<{ eventType: string; payload: Readonly<Record<string, unknown>> }>>): boolean {
-    return decisions.some((decision) => (
-      decision.eventType === 'ORDER_INTENT' &&
-      String(decision.payload.side ?? '').toUpperCase() === 'BUY'
-    ));
+  private primaryRunId(): string {
+    return this.runtimeByStrategy.STRAT_B.runId;
   }
 
-  private evaluateEntryBlockReason(eventTsMs: number): string | undefined {
-    const result = evaluateEntryBlock(
-      this.riskState,
-      {
-        dailyLossLimitPct: this.riskDailyLossLimitPct,
-        maxConsecutiveLosses: this.riskMaxConsecutiveLosses,
-        maxDailyOrders: this.riskMaxDailyOrders,
-        killSwitchEnabled: this.riskKillSwitchEnabled
-      },
-      this.mode,
-      this.allowLiveTrading,
-      eventTsMs
-    );
-    this.riskState = result.nextState;
-    return result.reason;
+  private markAllRunsSnapshotDelay(delayed: boolean): void {
+    for (const strategyId of STRATEGY_IDS) {
+      const runtime = this.runtimeByStrategy[strategyId];
+      this.runsService.setSnapshotDelay(runtime.runId, delayed);
+    }
   }
 
-  private async emitRiskBlock(
-    reason: string,
-    eventTsMs: number,
-    candle: Readonly<{ time: number; open: number; high: number; low: number; close: number }>
-  ): Promise<void> {
-    const blockedEventType = reason === 'LIVE_GUARD_BLOCKED' ? 'LIVE_GUARD_BLOCKED' : 'RISK_BLOCK';
-    await this.emitStrategyEvent(blockedEventType, eventTsMs, candle, {
-      reason,
-      riskSnapshot: this.riskState
-    });
-    await this.emitStrategyEvent('PAUSE', eventTsMs, candle, {
-      reason,
-      riskSnapshot: this.riskState
+  private clearSnapshotDelayAfterLiveTrade(): void {
+    if (!this.snapshotRecoveryPending) {
+      return;
+    }
+
+    this.snapshotRecoveryPending = false;
+    this.markAllRunsSnapshotDelay(false);
+    this.logger.info('Runtime snapshot delay cleared by live trade recovery', {
+      source: 'modules.execution.upbitRealtime.handleMessage',
+      runId: this.primaryRunId(),
+      payload: { market: this.market }
     });
   }
 
-  private trackRiskFromDecision(decision: Readonly<{ eventType: string; payload: Readonly<Record<string, unknown>> }>): void {
-    if (decision.eventType !== 'EXIT') {
-      return;
+  private applyTransportStateToAllRuns(input: Readonly<{
+    connectionState: ConnectionState;
+    retryCount?: number;
+    nextRetryInMs?: number;
+  }>): void {
+    for (const strategyId of STRATEGY_IDS) {
+      const runtime = this.runtimeByStrategy[strategyId];
+      this.runsService.setTransportState(runtime.runId, input.connectionState, {
+        ...(typeof input.retryCount === 'number' ? { retryCount: input.retryCount } : {}),
+        ...(typeof input.nextRetryInMs === 'number' ? { nextRetryInMs: input.nextRetryInMs } : {})
+      });
     }
-    const pnlPct = decision.payload.pnlPct;
-    if (typeof pnlPct !== 'number') {
-      return;
-    }
-    this.riskState = onExitPnl(this.riskState, pnlPct, Date.now());
-  }
-
-  private incrementDailyOrders(eventTsMs: number): void {
-    this.riskState = onEntryAccepted(this.riskState, eventTsMs);
   }
 }

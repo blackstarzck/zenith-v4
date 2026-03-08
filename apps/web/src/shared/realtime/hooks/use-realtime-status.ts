@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { CONNECTION_STATE, type ConnectionState } from '@zenith/contracts';
+import {
+  CONNECTION_STATE,
+  type ConnectionState,
+  type RealtimeStatusDto
+} from '@zenith/contracts';
 import type { RealtimeStatus } from '../types/realtime-status';
 
 type UseRealtimeStatusOptions = Readonly<{
@@ -16,8 +20,10 @@ export function useRealtimeStatus(options: UseRealtimeStatusOptions = {}) {
   );
   const [lastEventAt, setLastEventAt] = useState<string | undefined>();
   const [isPending, setIsPending] = useState(false);
+  const [queueDepth, setQueueDepth] = useState<number | undefined>();
   const [retryCount, setRetryCount] = useState(0);
   const [nextRetryInMs, setNextRetryInMs] = useState<number | undefined>();
+  const [remoteStaleThresholdMs, setRemoteStaleThresholdMs] = useState<number | undefined>();
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
@@ -56,9 +62,24 @@ export function useRealtimeStatus(options: UseRealtimeStatusOptions = {}) {
     setConnectionState(CONNECTION_STATE.ERROR);
   }, []);
 
+  const syncFromRemote = useCallback((remoteStatus?: RealtimeStatusDto | RealtimeStatus) => {
+    if (!remoteStatus) {
+      return;
+    }
+
+    setConnectionState(remoteStatus.connectionState);
+    setLastEventAt(remoteStatus.lastEventAt);
+    setQueueDepth(remoteStatus.queueDepth);
+    setRetryCount(remoteStatus.retryCount ?? 0);
+    setNextRetryInMs(remoteStatus.nextRetryInMs);
+    setRemoteStaleThresholdMs(remoteStatus.staleThresholdMs);
+    setNowMs(Date.now());
+  }, []);
+
   const status = useMemo<RealtimeStatus>(() => {
+    const effectiveStaleThresholdMs = remoteStaleThresholdMs ?? staleThresholdMs;
     const last = lastEventAt ? Date.parse(lastEventAt) : undefined;
-    const stale = typeof last === 'number' && !Number.isNaN(last) && nowMs - last > staleThresholdMs;
+    const stale = typeof last === 'number' && !Number.isNaN(last) && nowMs - last > effectiveStaleThresholdMs;
 
     if (connectionState === CONNECTION_STATE.LIVE && stale) {
       return {
@@ -67,7 +88,9 @@ export function useRealtimeStatus(options: UseRealtimeStatusOptions = {}) {
         isStale: true,
         retryCount,
         ...(lastEventAt ? { lastEventAt } : {}),
+        ...(typeof queueDepth === 'number' ? { queueDepth } : {}),
         ...(typeof nextRetryInMs === 'number' ? { nextRetryInMs } : {}),
+        staleThresholdMs: effectiveStaleThresholdMs,
       };
     }
 
@@ -77,9 +100,21 @@ export function useRealtimeStatus(options: UseRealtimeStatusOptions = {}) {
       isStale: stale,
       retryCount,
       ...(lastEventAt ? { lastEventAt } : {}),
+      ...(typeof queueDepth === 'number' ? { queueDepth } : {}),
       ...(typeof nextRetryInMs === 'number' ? { nextRetryInMs } : {}),
+      staleThresholdMs: effectiveStaleThresholdMs,
     };
-  }, [connectionState, isPending, lastEventAt, nextRetryInMs, nowMs, retryCount, staleThresholdMs]);
+  }, [
+    connectionState,
+    isPending,
+    lastEventAt,
+    nextRetryInMs,
+    nowMs,
+    queueDepth,
+    remoteStaleThresholdMs,
+    retryCount,
+    staleThresholdMs
+  ]);
 
   return {
     status,
@@ -90,5 +125,6 @@ export function useRealtimeStatus(options: UseRealtimeStatusOptions = {}) {
     markError,
     setReconnectState,
     setConnectionState,
+    syncFromRemote,
   };
 }

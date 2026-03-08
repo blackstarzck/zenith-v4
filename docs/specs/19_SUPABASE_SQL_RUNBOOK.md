@@ -87,3 +87,56 @@ where schemaname = 'public'
 - 성공 로그: `Supabase diagnostics passed`
 - 실패 로그: `Supabase diagnostics failed` + `status/code/message/hint`
 - 이 로그가 실패이면 키/프로젝트/RLS를 먼저 점검한다.
+
+---
+
+## 6) Fill Ledger Rollout (ASCII appendix)
+- Migration file:
+  - `../../supabase/migrations/20260308010000_fill_ledger.sql`
+- SQL file for manual editor use:
+  - `../../supabase/sql/20260308_fill_ledger_backfill.sql`
+
+### Rollout order
+1. Apply the fill-ledger schema migration.
+2. Verify that `public.text_fills` exists and RLS/policies were created.
+3. Verify the historical backfill inserted valid legacy `FILL` rows.
+4. Deploy the application code that reads persisted fills from `text_fills`.
+
+### Verification queries
+```sql
+-- table exists
+select table_name
+from information_schema.tables
+where table_schema = 'public'
+  and table_name = 'text_fills';
+
+-- RLS enabled
+select tablename, rowsecurity
+from pg_tables
+where schemaname = 'public'
+  and tablename = 'text_fills';
+
+-- unique(run_id, seq) index exists
+select indexname, indexdef
+from pg_indexes
+where schemaname = 'public'
+  and tablename = 'text_fills'
+  and indexdef ilike '%(run_id, seq)%';
+
+-- compare raw valid fill count vs ledger count
+with raw_valid as (
+  select count(*) as cnt
+  from public.text_run_events
+  where event_type = 'FILL'
+    and jsonb_typeof(payload->'side') = 'string'
+    and jsonb_typeof(payload->'fillPrice') = 'number'
+    and upper(payload->>'side') in ('BUY', 'SELL')
+)
+select
+  (select cnt from raw_valid) as raw_valid_fill_count,
+  (select count(*) from public.text_fills) as fill_ledger_count;
+```
+
+### Notes
+- The app currently keeps a fallback to `text_run_events` only for pre-migration environments.
+- After the remote project finishes this rollout and stabilizes, the raw-event fallback can be removed in a later cleanup.

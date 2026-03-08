@@ -21,6 +21,8 @@ type RunDetailResponse = Readonly<{
     strategyVersion: string;
     updatedAt: string;
     riskSnapshot: Readonly<{
+      seedKrw: number;
+      maxPositionRatio: number;
       dailyLossLimitPct: number;
       maxConsecutiveLosses: number;
       maxDailyOrders: number;
@@ -68,6 +70,12 @@ export function ReportRunDetailPage() {
           </Descriptions.Item>
           <Descriptions.Item label="평균 이익(kpi.avgWinPct)">{data ? `${data.kpi.avgWinPct.toFixed(4)}%` : '0.0000%'}</Descriptions.Item>
           <Descriptions.Item label="평균 손실(kpi.avgLossPct)">{data ? `${data.kpi.avgLossPct.toFixed(4)}%` : '0.0000%'}</Descriptions.Item>
+          <Descriptions.Item label="시드(seedKrw)">
+            {data?.runConfig.riskSnapshot.seedKrw?.toLocaleString('ko-KR') ?? '-'}
+          </Descriptions.Item>
+          <Descriptions.Item label="최대 비중(maxPositionRatio)">
+            {data ? `${(data.runConfig.riskSnapshot.maxPositionRatio * 100).toFixed(2)}%` : '-'}
+          </Descriptions.Item>
           <Descriptions.Item label="리스크 한도(runConfig.riskSnapshot.dailyLossLimitPct)">
             {data ? `${data.runConfig.riskSnapshot.dailyLossLimitPct}%` : '-'}
           </Descriptions.Item>

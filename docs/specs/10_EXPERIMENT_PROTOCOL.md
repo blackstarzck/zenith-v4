@@ -144,3 +144,92 @@
   3) 파라미터/로직 수정
   4) 동일 조건 재백테스트
   5) 개선 여부를 runId 비교 리포트로 검증
+### 7.1 Candle validity guard
+- Realtime and snapshot candles used for evaluation/replay must be minute-bucket aligned.
+- If a startup snapshot loader times out, the unfinished loader must not keep mutating runtime candle state during live evaluation.
+- Realtime evaluation must ignore a closed candle when the candle timestamp is abnormally older than the triggering live trade timestamp.
+
+### 7.2 Execution sequence regression guard
+- Execution order regression checks must use `apps/api/src/modules/execution/engine/execution-sequence.ts` as the canonical source.
+- Entry verification order: `SIGNAL_EMIT -> ORDER_INTENT -> FILL -> POSITION_UPDATE`
+- Exit verification order: `EXIT -> ORDER_INTENT -> FILL -> POSITION_UPDATE`
+- STRAT_B semi-auto verification order:
+  - request phase: `SIGNAL_EMIT -> APPROVE_ENTER`
+  - approved execution phase: `ORDER_INTENT -> FILL -> POSITION_UPDATE`
+
+### 7.3 Realtime engine boundary regression guard
+- Realtime engine refactors must keep the following module boundaries explicit:
+  - candle state: `apps/api/src/modules/execution/engine/realtime-candle-state.ts`
+  - runtime transition: `apps/api/src/modules/execution/engine/strategy-runtime-processor.ts`
+  - runtime boot state: `apps/api/src/modules/execution/engine/strategy-runtime-state.ts`
+  - websocket orchestration: `apps/api/src/modules/execution/engine/upbit-realtime-engine.ts`
+- Regression checks must verify that a live trade still flows through these phases without skipping:
+  1. trade message decode
+  2. minute candle update
+  3. closed candle detection
+  4. strategy runtime transition
+  5. event publish/persist
+- Tests should prefer direct unit coverage of the extracted helper modules in addition to the high-level engine tests.
+
+### 7.4 Runtime mode transition regression guard
+- Mode-specific transition checks must use `apps/api/src/modules/execution/engine/strategy-runtime-mode-machine.ts` as the canonical source.
+- Lifecycle sync checks must use `apps/api/src/modules/execution/engine/strategy-runtime-state.ts`.
+- Minimum regression cases:
+  1. `SEMI_AUTO + FLAT + strategy entry signal -> WAITING_APPROVAL`
+  2. `SEMI_AUTO + WAITING_APPROVAL + approval missing -> WAITING_APPROVAL`
+  3. `SEMI_AUTO + WAITING_APPROVAL + approval consumed -> IN_POSITION`
+  4. `PAPER/AUTO/LIVE + FLAT + executable entry intent -> direct entry path`
+- Processor tests should assert both emitted events and resulting lifecycle state.
+
+### 7.5 Realtime network recovery regression guard
+- Websocket recovery checks must use `apps/api/src/modules/execution/engine/upbit-realtime-connection.ts` as the canonical source.
+- Minimum regression cases:
+  1. websocket open sends the trade-stream subscription payload
+  2. websocket close schedules reconnect with exponential backoff
+  3. reconnect open marks recovery metrics
+  4. owner stop/destroy prevents reconnect scheduling
+- Engine tests may stay high-level, but connection lifecycle tests should target the extracted helper directly.
+
+### 7.6 Runtime realtime status regression guard
+- `apps/api/src/modules/runs/runs.service.ts` must stay the canonical derivation point for `realtimeStatus`.
+- Minimum regression cases:
+  1. startup snapshot delay marks the run as `DELAYED`
+  2. persistence backlog marks the run as `DELAYED` with queue depth and retry metadata
+  3. websocket reconnect marks the run as `RECONNECTING`
+  4. repeated reconnect attempts may surface as `PAUSED`
+  5. stale `lastEventAt` degrades a nominally live run to `DELAYED`
+
+### 7.7 Persistence recovery regression guard
+- DB write recovery checks must use `apps/api/src/modules/ws/gateways/run-event-persistence-buffer.ts` as the canonical source.
+- Minimum regression cases:
+  1. first DB failure buffers the event and does not publish it yet
+  2. later successful flush publishes buffered events in order
+  3. duplicate `(runId, seq)` events are still dropped before persistence buffering
+  4. out-of-order but non-duplicate events remain observable and do not break the retry loop
+
+### 7.8 Snapshot timeout recovery regression guard
+- If startup snapshot bootstrap times out, the unfinished snapshot task must not clear runtime delayed status by itself.
+- The first valid live trade must clear the delayed snapshot state for all runtime strategies.
+
+### 7.9 Fill ledger regression guard
+- Persisted fill regression checks must treat `public.text_fills` as the durable source of truth for fill history.
+- Minimum regression cases:
+  1. valid `FILL` persists to both `text_run_events` and `text_fills`
+  2. retry after partial success still inserts a missing `text_fills` row when `text_run_events` already has `(run_id, seq)`
+  3. strategy fill history and account summary continue to match after general run event retention rotates older ticks/events out
+  4. rollout backfill from `text_run_events` to `text_fills` is idempotent
+
+### 7.10 Realtime account summary regression guard
+- `apps/api/src/modules/runs/runs.service.ts` must remain the canonical derivation point for strategy account summary mark-to-market fields.
+- Minimum regression cases:
+  1. latest retained strategy candle close overrides the last fill price for `markPriceKrw` on an open position
+  2. `FILL` still updates `positionQty`, `avgEntryPriceKrw`, and `realizedPnlKrw` before mark-to-market recalculation
+  3. live market updates change `totalPnlKrw` and `totalPnlPct` without mutating fill-driven fields
+
+### 7.11 Position sizing regression guard
+- `StrategyRuntimeProcessor` must size both direct entry and semi-auto approved entry through one shared sizing path.
+- Minimum regression cases:
+  1. BUY `ORDER_INTENT`, BUY `FILL`, and BUY `POSITION_UPDATE` share one computed `qty`
+  2. SELL `ORDER_INTENT` and SELL `FILL` reuse the open runtime position qty
+  3. account-base sizing uses latest strategy equity when available and falls back to `seedKrw` on cold start
+  4. `ENTRY_READINESS=100` remains a readiness/status signal only; it must not imply a fixed quantity or repeated buy behavior by itself

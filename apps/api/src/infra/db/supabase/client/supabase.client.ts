@@ -41,6 +41,23 @@ type RunShellUpdate = Readonly<{
   updated_at?: string;
 }>;
 
+type PersistedRunEventRawRow = Readonly<{
+  id: number;
+  payload: Readonly<Record<string, unknown>>;
+}>;
+
+type FillLedgerInsert = Readonly<{
+  run_id: string;
+  seq: number;
+  event_ts: string;
+  trace_id: string;
+  side: 'BUY' | 'SELL';
+  qty: number;
+  fill_price: number;
+  notional_krw: number;
+  payload: Readonly<Record<string, unknown>>;
+}>;
+
 @Injectable()
 export class SupabaseClientService {
   constructor(
@@ -54,17 +71,8 @@ export class SupabaseClientService {
       await this.retryPolicy.runWithRetry(
         async (signal) => {
           await this.ensureRunExists(event, signal);
-          await this.rest.post(
-            'text_run_events',
-            {
-              run_id: event.runId,
-              seq: event.seq,
-              event_type: event.eventType,
-              event_ts: event.eventTs,
-              payload: event.payload
-            },
-            signal
-          );
+          await this.insertRunEventRow(event, signal);
+          await this.insertFillLedgerRowIfNeeded(event, signal);
         },
         {
           maxAttempts: 3,
@@ -72,8 +80,7 @@ export class SupabaseClientService {
           timeoutMs: 2000,
           source: 'infra.db.supabase.safeInsertRunEvent',
           timeoutEventType: SYSTEM_EVENT_TYPE.SUPABASE_TIMEOUT,
-          retryFailedEventType: SYSTEM_EVENT_TYPE.SUPABASE_WRITE_FAILED,
-          isNonRetriable: isDuplicateSupabaseError
+          retryFailedEventType: SYSTEM_EVENT_TYPE.SUPABASE_WRITE_FAILED
         }
       );
 
@@ -180,6 +187,114 @@ export class SupabaseClientService {
       .filter((row): row is WsEventEnvelopeDto => row !== undefined);
   }
 
+  async getLatestRunEventByType(runId: string, eventType: string): Promise<WsEventEnvelopeDto | undefined> {
+    const ctrl = new AbortController();
+    const rows = await this.rest.get<unknown[]>(
+      `text_run_events?select=run_id,seq,event_type,event_ts,payload&run_id=eq.${encodeURIComponent(runId)}&event_type=eq.${encodeURIComponent(eventType)}&order=event_ts.desc,seq.desc,id.desc&limit=1`,
+      ctrl.signal
+    );
+    const first = Array.isArray(rows) ? rows[0] : undefined;
+    return parsePersistedEventRow(first);
+  }
+
+  async listStrategyFillEvents(
+    strategyId: StrategyId,
+    page: number,
+    pageSize: number
+  ): Promise<readonly WsEventEnvelopeDto[]> {
+    try {
+      return await this.listStrategyFillEventsFromLedger(strategyId, page, pageSize);
+    } catch (error: unknown) {
+      if (!isMissingFillLedgerError(error)) {
+        throw error;
+      }
+    }
+
+    return this.listStrategyFillEventsFromRunEvents(strategyId, page, pageSize);
+  }
+
+  async listAllStrategyFillEvents(strategyId: StrategyId): Promise<readonly WsEventEnvelopeDto[]> {
+    const pageSize = 200;
+    let page = 1;
+    const items: WsEventEnvelopeDto[] = [];
+
+    while (true) {
+      const chunk = await this.listStrategyFillEvents(strategyId, page, pageSize);
+      if (chunk.length === 0) {
+        break;
+      }
+      items.push(...chunk);
+      if (chunk.length < pageSize) {
+        break;
+      }
+      page += 1;
+    }
+
+    return items;
+  }
+
+  async countStrategyFillEvents(strategyId: StrategyId): Promise<number> {
+    try {
+      return await this.countStrategyFillEventsFromLedger(strategyId);
+    } catch (error: unknown) {
+      if (!isMissingFillLedgerError(error)) {
+        throw error;
+      }
+    }
+
+    return this.countStrategyFillEventsFromRunEvents(strategyId);
+  }
+
+  async purgeInvalidFillEvents(): Promise<Readonly<{ deleted: number; scanned: number }>> {
+    const batchSize = 1000;
+    let lastSeenId = 0;
+    let scanned = 0;
+    let deleted = 0;
+
+    while (true) {
+      const ctrl = new AbortController();
+      const rows = await this.rest.get<unknown[]>(
+        `text_run_events?select=id,payload&event_type=eq.FILL&id=gt.${lastSeenId}&order=id.asc&limit=${batchSize}`,
+        ctrl.signal
+      );
+      const parsed = rows
+        .map(parseRunEventRawRow)
+        .filter((row): row is PersistedRunEventRawRow => row !== undefined);
+      if (parsed.length === 0) {
+        break;
+      }
+
+      scanned += parsed.length;
+      lastSeenId = parsed[parsed.length - 1]?.id ?? lastSeenId;
+      const invalidIds = parsed
+        .filter((row) => {
+          const side = row.payload.side;
+          const fillPrice = row.payload.fillPrice;
+          const hasValidSide = typeof side === 'string' && side.trim().length > 0;
+          const hasValidFillPrice = typeof fillPrice === 'number' && Number.isFinite(fillPrice);
+          return !(hasValidSide && hasValidFillPrice);
+        })
+        .map((row) => row.id);
+
+      if (invalidIds.length > 0) {
+        const chunkSize = 200;
+        for (let index = 0; index < invalidIds.length; index += chunkSize) {
+          const chunk = invalidIds.slice(index, index + chunkSize);
+          const filter = chunk.join(',');
+          const deleteCtrl = new AbortController();
+          await this.rest.delete(`text_run_events?id=in.(${filter})`, deleteCtrl.signal);
+          deleted += chunk.length;
+        }
+      }
+
+      if (parsed.length < batchSize) {
+        break;
+      }
+    }
+
+    return { deleted, scanned };
+  }
+
   async getLastRunEventSeq(runId: string): Promise<number> {
     const ctrl = new AbortController();
     const rows = await this.rest.get<unknown[]>(
@@ -239,6 +354,134 @@ export class SupabaseClientService {
           reason: parsed.message
         }
       });
+    }
+  }
+
+  private async listStrategyFillEventsFromLedger(
+    strategyId: StrategyId,
+    page: number,
+    pageSize: number
+  ): Promise<readonly WsEventEnvelopeDto[]> {
+    const ctrl = new AbortController();
+    const safePage = Math.max(1, Math.floor(page));
+    const safePageSize = Math.max(1, Math.min(Math.floor(pageSize), 200));
+    const offset = (safePage - 1) * safePageSize;
+    const rows = await this.rest.get<unknown[]>(
+      `text_fills?select=run_id,seq,event_ts,trace_id,payload,side,qty,fill_price,text_runs!inner(strategy_id)&text_runs.strategy_id=eq.${encodeURIComponent(strategyId)}&order=event_ts.desc,seq.desc,id.desc&limit=${safePageSize}&offset=${offset}`,
+      ctrl.signal
+    );
+    return rows
+      .map(parsePersistedFillRow)
+      .filter((row): row is WsEventEnvelopeDto => row !== undefined);
+  }
+
+  private async listStrategyFillEventsFromRunEvents(
+    strategyId: StrategyId,
+    page: number,
+    pageSize: number
+  ): Promise<readonly WsEventEnvelopeDto[]> {
+    const ctrl = new AbortController();
+    const safePage = Math.max(1, Math.floor(page));
+    const safePageSize = Math.max(1, Math.min(Math.floor(pageSize), 200));
+    const offset = (safePage - 1) * safePageSize;
+    const rows = await this.rest.get<unknown[]>(
+      `text_run_events?select=run_id,seq,event_type,event_ts,payload,text_runs!inner(strategy_id)&event_type=eq.FILL&text_runs.strategy_id=eq.${encodeURIComponent(strategyId)}&order=event_ts.desc,seq.desc,id.desc&limit=${safePageSize}&offset=${offset}`,
+      ctrl.signal
+    );
+    return rows
+      .map(parsePersistedEventRow)
+      .filter((row): row is WsEventEnvelopeDto => row !== undefined);
+  }
+
+  private async countStrategyFillEventsFromLedger(strategyId: StrategyId): Promise<number> {
+    const ctrl = new AbortController();
+    const { contentRange } = await this.rest.getWithMeta<unknown[]>(
+      `text_fills?select=id,text_runs!inner(strategy_id)&text_runs.strategy_id=eq.${encodeURIComponent(strategyId)}&limit=1`,
+      ctrl.signal,
+      { countExact: true }
+    );
+    if (!contentRange) {
+      return 0;
+    }
+    const slashIndex = contentRange.lastIndexOf('/');
+    if (slashIndex < 0) {
+      return 0;
+    }
+    const totalText = contentRange.slice(slashIndex + 1);
+    const total = Number(totalText);
+    return Number.isFinite(total) ? total : 0;
+  }
+
+  private async countStrategyFillEventsFromRunEvents(strategyId: StrategyId): Promise<number> {
+    const ctrl = new AbortController();
+    const { contentRange } = await this.rest.getWithMeta<unknown[]>(
+      `text_run_events?select=id,text_runs!inner(strategy_id)&event_type=eq.FILL&text_runs.strategy_id=eq.${encodeURIComponent(strategyId)}&limit=1`,
+      ctrl.signal,
+      { countExact: true }
+    );
+    if (!contentRange) {
+      return 0;
+    }
+    const slashIndex = contentRange.lastIndexOf('/');
+    if (slashIndex < 0) {
+      return 0;
+    }
+    const totalText = contentRange.slice(slashIndex + 1);
+    const total = Number(totalText);
+    return Number.isFinite(total) ? total : 0;
+  }
+
+  private async insertRunEventRow(event: WsEventEnvelopeDto, signal: AbortSignal): Promise<void> {
+    try {
+      await this.rest.post(
+        'text_run_events',
+        {
+          run_id: event.runId,
+          seq: event.seq,
+          event_type: event.eventType,
+          event_ts: event.eventTs,
+          payload: event.payload
+        },
+        signal
+      );
+    } catch (error: unknown) {
+      if (isDuplicateSupabaseError(error)) {
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private async insertFillLedgerRowIfNeeded(event: WsEventEnvelopeDto, signal: AbortSignal): Promise<void> {
+    const payload = buildFillLedgerInsert(event);
+    if (!payload) {
+      return;
+    }
+
+    try {
+      await this.rest.post('text_fills', payload, signal);
+    } catch (error: unknown) {
+      if (isDuplicateSupabaseError(error)) {
+        return;
+      }
+      if (isMissingFillLedgerError(error)) {
+        const parsed = parseSupabaseError(error);
+        this.logger.warn('Fill ledger persistence skipped because text_fills is unavailable', {
+          source: 'infra.db.supabase.safeInsertRunEvent',
+          eventType: SYSTEM_EVENT_TYPE.SUPABASE_WRITE_FAILED,
+          runId: event.runId,
+          traceId: event.traceId,
+          payload: {
+            seq: event.seq,
+            status: parsed.status,
+            code: parsed.code,
+            hint: parsed.hint,
+            reason: parsed.message
+          }
+        });
+        return;
+      }
+      throw error;
     }
   }
 
@@ -432,7 +675,131 @@ function parsePersistedEventRow(value: unknown): WsEventEnvelopeDto | undefined 
   };
 }
 
+function parsePersistedFillRow(value: unknown): WsEventEnvelopeDto | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const row = value as Record<string, unknown>;
+  const runId = row.run_id;
+  const seq = row.seq;
+  const eventTs = row.event_ts;
+  const traceId = row.trace_id;
+  const payload = toRecord(row.payload);
+  const side = row.side;
+  const qty = row.qty;
+  const fillPrice = row.fill_price;
+
+  if (
+    typeof runId !== 'string' ||
+    typeof seq !== 'number' ||
+    typeof eventTs !== 'string'
+  ) {
+    return undefined;
+  }
+
+  return {
+    runId,
+    seq,
+    traceId: typeof traceId === 'string' ? traceId : `persisted-fill-${runId}-${seq}`,
+    eventType: 'FILL',
+    eventTs,
+    payload: {
+      ...payload,
+      ...(typeof side === 'string' ? { side } : {}),
+      ...(typeof qty === 'number' && Number.isFinite(qty) ? { qty } : {}),
+      ...(typeof fillPrice === 'number' && Number.isFinite(fillPrice) ? { fillPrice } : {})
+    }
+  };
+}
+
+function parseRunEventRawRow(value: unknown): PersistedRunEventRawRow | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const row = value as Record<string, unknown>;
+  const id = row.id;
+  const payload = row.payload;
+  if (typeof id !== 'number' || !Number.isFinite(id)) {
+    return undefined;
+  }
+  return {
+    id,
+    payload: toRecord(payload)
+  };
+}
+
 function isDuplicateSupabaseError(error: unknown): boolean {
   const parsed = parseSupabaseError(error);
   return parsed.code === '23505' || parsed.message.includes('duplicate key value');
+}
+
+function buildFillLedgerInsert(event: WsEventEnvelopeDto): FillLedgerInsert | undefined {
+  if (event.eventType !== 'FILL') {
+    return undefined;
+  }
+
+  const payload = toRecord(event.payload);
+  const side = normalizeFillSide(payload.side);
+  const fillPrice = payload.fillPrice;
+  if (!side || typeof fillPrice !== 'number' || !Number.isFinite(fillPrice)) {
+    return undefined;
+  }
+
+  return {
+    run_id: event.runId,
+    seq: event.seq,
+    event_ts: event.eventTs,
+    trace_id: event.traceId,
+    side,
+    qty: resolveFillQty(payload),
+    fill_price: fillPrice,
+    notional_krw: resolveFillNotionalKrw(payload, fillPrice),
+    payload
+  };
+}
+
+function normalizeFillSide(value: unknown): 'BUY' | 'SELL' | undefined {
+  if (typeof value !== 'string') {
+    return undefined;
+  }
+  const normalized = value.trim().toUpperCase();
+  return normalized === 'BUY' || normalized === 'SELL'
+    ? normalized
+    : undefined;
+}
+
+function resolveFillQty(payload: Readonly<Record<string, unknown>>): number {
+  const qty = payload.qty;
+  if (typeof qty === 'number' && Number.isFinite(qty) && qty > 0) {
+    return qty;
+  }
+
+  const quantity = payload.quantity;
+  if (typeof quantity === 'number' && Number.isFinite(quantity) && quantity > 0) {
+    return quantity;
+  }
+
+  return 1;
+}
+
+function resolveFillNotionalKrw(
+  payload: Readonly<Record<string, unknown>>,
+  fillPrice: number
+): number {
+  const notionalKrw = payload.notionalKrw;
+  if (typeof notionalKrw === 'number' && Number.isFinite(notionalKrw) && notionalKrw > 0) {
+    return roundMoney(notionalKrw);
+  }
+
+  return roundMoney(fillPrice * resolveFillQty(payload));
+}
+
+function roundMoney(value: number): number {
+  return Number(value.toFixed(2));
+}
+
+function isMissingFillLedgerError(error: unknown): boolean {
+  const parsed = parseSupabaseError(error);
+  return parsed.status === 404 && parsed.message.toLowerCase().includes('text_fills');
 }

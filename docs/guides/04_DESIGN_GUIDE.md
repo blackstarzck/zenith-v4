@@ -42,6 +42,7 @@
 - 손익 색상: +/-(상승/하락) 일관성
 - 경고/위험: 리스크 한도 근접 시 강조
 - 표기 단위: KRW / % / 코인 수량을 항상 명시
+- 상세 색상 토큰(BUY/SELL/ERROR/WARNING/INFO/PAUSED/MDD): `05_COLOR_SEMANTICS.md` 기준을 사용
 
 ---
 

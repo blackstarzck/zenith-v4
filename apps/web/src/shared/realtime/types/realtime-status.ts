@@ -5,6 +5,8 @@ export type RealtimeStatus = Readonly<{
   isPending: boolean;
   isStale: boolean;
   lastEventAt?: string;
+  queueDepth?: number;
   retryCount: number;
   nextRetryInMs?: number;
+  staleThresholdMs?: number;
 }>;

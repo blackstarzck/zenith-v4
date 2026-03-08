@@ -1,10 +1,41 @@
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { WsEventEnvelopeDto } from '@zenith/contracts';
+import { CONNECTION_STATE, type WsEventEnvelopeDto } from '@zenith/contracts';
 import { RunsService } from '../src/modules/runs/runs.service';
 
-test('RunsService returns run history and run detail', () => {
-  const svc = new RunsService();
+function createRunsService(): RunsService {
+  return new RunsService({
+    listRuns: async () => [],
+    getRun: async () => undefined,
+    listRunEvents: async () => [],
+    getLatestRunEventByType: async () => undefined,
+    updateRunShell: async () => undefined,
+    listAllStrategyFillEvents: async () => []
+  } as unknown as ConstructorParameters<typeof RunsService>[0]);
+}
+
+function createFillEvent(
+  runId: string,
+  seq: number,
+  payload?: Readonly<Record<string, unknown>>
+): WsEventEnvelopeDto {
+  return {
+    runId,
+    seq,
+    traceId: `trace-${runId}-${seq}`,
+    eventType: 'FILL',
+    eventTs: new Date(1_700_000_000_000 + seq * 1000).toISOString(),
+    payload: {
+      side: 'BUY',
+      fillPrice: 100,
+      qty: 1,
+      ...(payload ?? {})
+    }
+  };
+}
+
+test('RunsService returns run history and run detail', async () => {
+  const svc = createRunsService();
   svc.seedRun('run-1');
 
   const event: WsEventEnvelopeDto = {
@@ -18,17 +49,17 @@ test('RunsService returns run history and run detail', () => {
 
   svc.ingestEvent(event);
 
-  const history = svc.listRuns();
-  assert.equal(history.length, 1);
-  assert.equal(history[0]?.runId, 'run-1');
+  const history = await svc.listRuns();
+  assert.ok(history.length >= 1);
+  assert.ok(history.some((item) => item.runId === 'run-1'));
 
-  const run = svc.getRun('run-1');
+  const run = await svc.getRun('run-1');
   assert.ok(run);
   assert.equal(run?.events.length, 1);
 });
 
-test('RunsService builds export artifacts', () => {
-  const svc = new RunsService();
+test('RunsService builds export artifacts', async () => {
+  const svc = createRunsService();
 
   const fills: WsEventEnvelopeDto[] = [
     {
@@ -51,15 +82,15 @@ test('RunsService builds export artifacts', () => {
 
   fills.forEach((e) => svc.ingestEvent(e));
 
-  const jsonl = svc.getEventsJsonl('run-2');
-  const csv = svc.getTradesCsv('run-2');
+  const jsonl = await svc.getEventsJsonl('run-2');
+  const csv = await svc.getTradesCsv('run-2');
 
   assert.ok(jsonl?.includes('"eventType":"FILL"'));
   assert.ok(csv?.startsWith('tradeId,entryTime,exitReason,netReturnPct,seq'));
 });
 
-test('RunsService returns candle snapshot from market tick events', () => {
-  const svc = new RunsService();
+test('RunsService returns candle snapshot from market tick events', async () => {
+  const svc = createRunsService();
 
   const events: WsEventEnvelopeDto[] = [
     {
@@ -69,7 +100,7 @@ test('RunsService returns candle snapshot from market tick events', () => {
       eventType: 'MARKET_TICK',
       eventTs: new Date().toISOString(),
       payload: {
-        candle: { time: 100, open: 1, high: 3, low: 1, close: 2 }
+        candle: { time: 120, open: 1, high: 3, low: 1, close: 2 }
       }
     },
     {
@@ -79,7 +110,7 @@ test('RunsService returns candle snapshot from market tick events', () => {
       eventType: 'MARKET_TICK',
       eventTs: new Date().toISOString(),
       payload: {
-        candle: { time: 100, open: 1, high: 4, low: 1, close: 3 }
+        candle: { time: 120, open: 1, high: 4, low: 1, close: 3 }
       }
     },
     {
@@ -89,21 +120,54 @@ test('RunsService returns candle snapshot from market tick events', () => {
       eventType: 'MARKET_TICK',
       eventTs: new Date().toISOString(),
       payload: {
-        candle: { time: 160, open: 3, high: 5, low: 2, close: 4 }
+        candle: { time: 180, open: 3, high: 5, low: 2, close: 4 }
       }
     }
   ];
 
   events.forEach((event) => svc.ingestEvent(event));
 
-  const candles = svc.getCandles('run-3', 300);
+  const candles = await svc.getCandles('run-3', 300);
   assert.equal(candles?.length, 2);
-  assert.deepEqual(candles?.[0], { time: 100, open: 1, high: 4, low: 1, close: 3 });
-  assert.deepEqual(candles?.[1], { time: 160, open: 3, high: 5, low: 2, close: 4 });
+  assert.deepEqual(candles?.[0], { time: 120, open: 1, high: 4, low: 1, close: 3 });
+  assert.deepEqual(candles?.[1], { time: 180, open: 3, high: 5, low: 2, close: 4 });
 });
 
-test('RunsService computes KPI from EXIT pnl events', () => {
-  const svc = new RunsService();
+test('RunsService normalizes off-minute candle timestamps to minute buckets', async () => {
+  const svc = createRunsService();
+
+  const events: WsEventEnvelopeDto[] = [
+    {
+      runId: 'run-3b',
+      seq: 1,
+      traceId: 'trace-1',
+      eventType: 'MARKET_TICK',
+      eventTs: new Date().toISOString(),
+      payload: {
+        candle: { time: 1772888934, open: 2015, high: 2015, low: 2014, close: 2014 }
+      }
+    },
+    {
+      runId: 'run-3b',
+      seq: 2,
+      traceId: 'trace-2',
+      eventType: 'MARKET_TICK',
+      eventTs: new Date().toISOString(),
+      payload: {
+        candle: { time: 1772888939, open: 2015, high: 2016, low: 2014, close: 2016 }
+      }
+    }
+  ];
+
+  events.forEach((event) => svc.ingestEvent(event));
+
+  const candles = await svc.getCandles('run-3b', 300);
+  assert.equal(candles?.length, 1);
+  assert.deepEqual(candles?.[0], { time: 1772888880, open: 2015, high: 2016, low: 2014, close: 2016 });
+});
+
+test('RunsService computes KPI from EXIT pnl events', async () => {
+  const svc = createRunsService();
   svc.seedRun('run-kpi');
 
   const events: WsEventEnvelopeDto[] = [
@@ -134,7 +198,7 @@ test('RunsService computes KPI from EXIT pnl events', () => {
   ];
   events.forEach((event) => svc.ingestEvent(event));
 
-  const run = svc.getRun('run-kpi');
+  const run = await svc.getRun('run-kpi');
   assert.equal(run?.kpi.trades, 1);
   assert.equal(run?.kpi.exits, 2);
   assert.equal(run?.kpi.winRate, 50);
@@ -145,8 +209,8 @@ test('RunsService computes KPI from EXIT pnl events', () => {
   assert.equal(run?.kpi.avgLossPct, -0.7);
 });
 
-test('RunsService ignores legacy fill events without side/fillPrice in trade counts', () => {
-  const svc = new RunsService();
+test('RunsService ignores legacy fill events without side/fillPrice in trade counts', async () => {
+  const svc = createRunsService();
   svc.seedRun('run-legacy-fill');
 
   const events: WsEventEnvelopeDto[] = [
@@ -170,19 +234,115 @@ test('RunsService ignores legacy fill events without side/fillPrice in trade cou
 
   events.forEach((event) => svc.ingestEvent(event));
 
-  const run = svc.getRun('run-legacy-fill');
-  const csv = svc.getTradesCsv('run-legacy-fill');
+  const run = await svc.getRun('run-legacy-fill');
+  const csv = await svc.getTradesCsv('run-legacy-fill');
 
   assert.equal(run?.kpi.trades, 1);
   assert.ok(csv?.includes('T-0001'));
   assert.ok(!csv?.includes('T-0002'));
 });
 
-test('RunsService updates run control fields', () => {
-  const svc = new RunsService();
+test('RunsService merges persisted fill ledger rows with runtime fills without duplicates', async () => {
+  const persisted = [
+    createFillEvent('run-strat-b-0001', 1, { side: 'BUY', fillPrice: 100, qty: 2 })
+  ];
+  const svc = new RunsService({
+    listRuns: async () => [],
+    getRun: async () => undefined,
+    listRunEvents: async () => [],
+    getLatestRunEventByType: async () => undefined,
+    updateRunShell: async () => undefined,
+    listAllStrategyFillEvents: async () => persisted
+  } as unknown as ConstructorParameters<typeof RunsService>[0]);
+
+  svc.seedRun('run-strat-b-0001', {
+    strategyId: 'STRAT_B',
+    strategyVersion: 'v1',
+    mode: 'PAPER',
+    market: 'KRW-XRP'
+  });
+  svc.ingestEvent(createFillEvent('run-strat-b-0001', 1, { side: 'BUY', fillPrice: 100, qty: 2 }));
+  svc.ingestEvent(createFillEvent('run-strat-b-0001', 2, { side: 'SELL', fillPrice: 105, qty: 2 }));
+
+  const page = await svc.listStrategyFills('STRAT_B', 1, 50);
+
+  assert.equal(page.total, 2);
+  assert.deepEqual(page.items.map((item) => item.seq), [2, 1]);
+});
+
+test('RunsService account summary uses persisted fill ledger rows as the source of truth', async () => {
+  const svc = new RunsService({
+    listRuns: async () => [],
+    getRun: async () => undefined,
+    listRunEvents: async () => [],
+    getLatestRunEventByType: async () => undefined,
+    updateRunShell: async () => undefined,
+    listAllStrategyFillEvents: async () => [
+      createFillEvent('run-strat-a-0001', 1, { side: 'BUY', fillPrice: 100, qty: 2 }),
+      createFillEvent('run-strat-a-0001', 2, { side: 'SELL', fillPrice: 110, qty: 1 })
+    ]
+  } as unknown as ConstructorParameters<typeof RunsService>[0]);
+
+  const summary = await svc.getStrategyAccountSummary('STRAT_A');
+
+  assert.equal(summary.fillCount, 2);
+  assert.equal(summary.positionQty, 1);
+  assert.equal(summary.cashKrw, 999910);
+  assert.equal(summary.avgEntryPriceKrw, 100);
+  assert.equal(summary.markPriceKrw, 110);
+  assert.equal(summary.realizedPnlKrw, 10);
+  assert.equal(summary.marketValueKrw, 110);
+  assert.equal(summary.equityKrw, 1000020);
+  assert.equal(summary.totalPnlKrw, 20);
+});
+
+test('RunsService account summary marks open position to the latest strategy candle close', async () => {
+  const svc = new RunsService({
+    listRuns: async () => [],
+    getRun: async () => undefined,
+    listRunEvents: async () => [],
+    getLatestRunEventByType: async () => undefined,
+    updateRunShell: async () => undefined,
+    listAllStrategyFillEvents: async () => [
+      createFillEvent('run-strat-a-0001', 1, { side: 'BUY', fillPrice: 100, qty: 2 }),
+      createFillEvent('run-strat-a-0001', 2, { side: 'SELL', fillPrice: 110, qty: 1 })
+    ]
+  } as unknown as ConstructorParameters<typeof RunsService>[0]);
+
+  svc.seedRun('run-strat-a-0001', {
+    strategyId: 'STRAT_A',
+    strategyVersion: 'v1',
+    mode: 'PAPER',
+    market: 'KRW-BTC'
+  });
+  svc.ingestEvent({
+    runId: 'run-strat-a-0001',
+    seq: 3,
+    traceId: 'trace-run-strat-a-0001-3',
+    eventType: 'MARKET_TICK',
+    eventTs: new Date(1_700_000_003_000).toISOString(),
+    payload: {
+      strategyId: 'STRAT_A',
+      candle: { time: 180, open: 108, high: 121, low: 107, close: 120 }
+    }
+  });
+
+  const summary = await svc.getStrategyAccountSummary('STRAT_A');
+
+  assert.equal(summary.fillCount, 2);
+  assert.equal(summary.positionQty, 1);
+  assert.equal(summary.markPriceKrw, 120);
+  assert.equal(summary.marketValueKrw, 120);
+  assert.equal(summary.equityKrw, 1000030);
+  assert.equal(summary.unrealizedPnlKrw, 20);
+  assert.equal(summary.totalPnlKrw, 30);
+});
+
+test('RunsService updates run control fields', async () => {
+  const svc = createRunsService();
   svc.seedRun('run-ctl', { strategyId: 'STRAT_A', mode: 'PAPER', market: 'KRW-XRP' });
 
-  const updated = svc.updateRunControl('run-ctl', {
+  const updated = await svc.updateRunControl('run-ctl', {
     strategyId: 'STRAT_C',
     strategyVersion: 'v2',
     mode: 'AUTO',
@@ -205,33 +365,39 @@ test('RunsService updates run control fields', () => {
   assert.equal(config?.strategyVersion, 'v2');
   assert.equal(config?.mode, 'AUTO');
   assert.equal(config?.market, 'KRW-BTC');
+  assert.equal(config?.riskSnapshot.seedKrw, 1_000_000);
+  assert.equal(config?.riskSnapshot.maxPositionRatio, 0.2);
 });
 
-test('RunsService filters run history by strategy/mode/market', () => {
-  const svc = new RunsService();
+test('RunsService filters run history by strategy/mode/market', async () => {
+  const svc = createRunsService();
   svc.seedRun('run-a-paper', { strategyId: 'STRAT_A', strategyVersion: 'v1', mode: 'PAPER', market: 'KRW-BTC' });
   svc.seedRun('run-a-auto', { strategyId: 'STRAT_A', strategyVersion: 'v2', mode: 'AUTO', market: 'KRW-XRP' });
   svc.seedRun('run-b-paper', { strategyId: 'STRAT_B', strategyVersion: 'v2', mode: 'PAPER', market: 'KRW-XRP' });
 
-  const byStrategy = svc.listRuns({ strategyId: 'STRAT_A' });
-  assert.equal(byStrategy.length, 2);
+  const byStrategy = await svc.listRuns({ strategyId: 'STRAT_A' });
+  assert.ok(byStrategy.some((item) => item.runId === 'run-a-paper'));
+  assert.ok(byStrategy.some((item) => item.runId === 'run-a-auto'));
 
-  const byMode = svc.listRuns({ mode: 'PAPER' });
-  assert.equal(byMode.length, 2);
+  const byMode = await svc.listRuns({ mode: 'PAPER' });
+  assert.ok(byMode.some((item) => item.runId === 'run-a-paper'));
+  assert.ok(byMode.some((item) => item.runId === 'run-b-paper'));
 
-  const byMarket = svc.listRuns({ market: 'KRW-XRP' });
-  assert.equal(byMarket.length, 2);
+  const byMarket = await svc.listRuns({ market: 'KRW-XRP' });
+  assert.ok(byMarket.some((item) => item.runId === 'run-a-auto'));
+  assert.ok(byMarket.some((item) => item.runId === 'run-b-paper'));
 
-  const byVersion = svc.listRuns({ strategyVersion: 'v2' });
-  assert.equal(byVersion.length, 2);
+  const byVersion = await svc.listRuns({ strategyVersion: 'v2' });
+  assert.ok(byVersion.some((item) => item.runId === 'run-a-auto'));
+  assert.ok(byVersion.some((item) => item.runId === 'run-b-paper'));
 
-  const composite = svc.listRuns({ strategyId: 'STRAT_A', mode: 'AUTO', market: 'KRW-XRP' });
+  const composite = await svc.listRuns({ strategyId: 'STRAT_A', mode: 'AUTO', market: 'KRW-XRP' });
   assert.equal(composite.length, 1);
   assert.equal(composite[0]?.runId, 'run-a-auto');
 });
 
 test('RunsService validates event payload against runConfig snapshot', () => {
-  const svc = new RunsService();
+  const svc = createRunsService();
   svc.seedRun('run-match', { strategyId: 'STRAT_B', strategyVersion: 'v1', mode: 'PAPER', market: 'KRW-XRP' });
 
   const mismatched: WsEventEnvelopeDto = {
@@ -251,7 +417,7 @@ test('RunsService validates event payload against runConfig snapshot', () => {
 });
 
 test('RunsService approve token can be queued and consumed once', () => {
-  const svc = new RunsService();
+  const svc = createRunsService();
   svc.seedRun('run-approve');
 
   const approved = svc.approvePendingEntry('run-approve');
@@ -261,4 +427,52 @@ test('RunsService approve token can be queued and consumed once', () => {
   assert.equal(approved, true);
   assert.equal(consumedFirst, true);
   assert.equal(consumedSecond, false);
+});
+
+test('RunsService derives realtime status from snapshot delay, persistence backlog, transport state, and stale last event', async () => {
+  const svc = createRunsService();
+  svc.seedRun('run-rt');
+
+  const live = svc.getRealtimeStatus('run-rt');
+  assert.equal(live?.connectionState, CONNECTION_STATE.LIVE);
+
+  const snapshotDelayed = svc.setSnapshotDelay('run-rt', true, 5_000);
+  assert.equal(snapshotDelayed.connectionState, CONNECTION_STATE.DELAYED);
+
+  svc.setSnapshotDelay('run-rt', false, 5_000);
+  const backlog = svc.setPersistenceBacklog('run-rt', {
+    queueDepth: 2,
+    retryCount: 1,
+    nextRetryInMs: 500
+  });
+  assert.equal(backlog.connectionState, CONNECTION_STATE.DELAYED);
+  assert.equal(backlog.queueDepth, 2);
+  assert.equal(backlog.retryCount, 1);
+  assert.equal(backlog.nextRetryInMs, 500);
+
+  svc.setPersistenceBacklog('run-rt', { queueDepth: 0 });
+  const reconnecting = svc.setTransportState('run-rt', CONNECTION_STATE.RECONNECTING, {
+    retryCount: 2,
+    nextRetryInMs: 2000
+  });
+  assert.equal(reconnecting.connectionState, CONNECTION_STATE.RECONNECTING);
+  assert.equal(reconnecting.retryCount, 2);
+  assert.equal(reconnecting.nextRetryInMs, 2000);
+
+  svc.setTransportState('run-rt', CONNECTION_STATE.LIVE, {
+    staleThresholdMs: 1_000
+  });
+  svc.ingestEvent({
+    runId: 'run-rt',
+    seq: 1,
+    traceId: 'trace-stale',
+    eventType: 'MARKET_TICK',
+    eventTs: new Date(Date.now() - 5_000).toISOString(),
+    payload: {
+      candle: { time: 120, open: 1, high: 1, low: 1, close: 1 }
+    }
+  });
+
+  const staleRun = await svc.getRun('run-rt');
+  assert.equal(staleRun?.realtimeStatus?.connectionState, CONNECTION_STATE.DELAYED);
 });

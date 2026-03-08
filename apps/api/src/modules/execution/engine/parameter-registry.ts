@@ -2,10 +2,13 @@ export const PARAMETER_KEYS = Object.freeze({
   common: {
     mode: 'common.mode',
     fillModel: 'common.fillModel',
+    seedKrw: 'common.seedKrw',
     market: 'common.market',
+    riskMaxPositionRatio: 'common.risk.maxPositionRatio',
     riskDailyLossLimitPct: 'common.risk.dailyLossLimitPct',
     riskMaxConsecutiveLosses: 'common.risk.maxConsecutiveLosses',
-    riskMaxDailyOrders: 'common.risk.maxDailyOrders'
+    riskMaxDailyOrders: 'common.risk.maxDailyOrders',
+    riskKillSwitch: 'common.risk.killSwitch'
   },
   a: {
     entryAfterConfirmFill: 'a.entry.afterConfirmFill',
@@ -58,6 +61,14 @@ export const PARAMETER_KEYS = Object.freeze({
 });
 
 export const DEFAULT_PARAMETER_VALUES = Object.freeze({
+  common: {
+    seedKrw: 1_000_000,
+    riskMaxPositionRatio: 0.2,
+    riskDailyLossLimitPct: -2,
+    riskMaxConsecutiveLosses: 3,
+    riskMaxDailyOrders: 200,
+    riskKillSwitch: true
+  },
   a: {
     bbPeriod: 20,
     bbStd: 2.0,

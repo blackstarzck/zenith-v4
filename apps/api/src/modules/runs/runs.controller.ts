@@ -5,6 +5,37 @@ import { RunsService } from './runs.service';
 export class RunsController {
   constructor(private readonly runsService: RunsService) {}
 
+  @Get('strategies/:strategyId/fills')
+  async getStrategyFills(
+    @Param('strategyId') strategyId: string,
+    @Query('page') pageText?: string,
+    @Query('pageSize') pageSizeText?: string
+  ) {
+    if (strategyId !== 'STRAT_A' && strategyId !== 'STRAT_B' && strategyId !== 'STRAT_C') {
+      throw new NotFoundException('strategy not found');
+    }
+    const page = Number(pageText ?? '1');
+    const pageSize = Number(pageSizeText ?? '50');
+    return this.runsService.listStrategyFills(
+      strategyId,
+      Number.isFinite(page) ? page : 1,
+      Number.isFinite(pageSize) ? pageSize : 50
+    );
+  }
+
+  @Get('strategies/:strategyId/account-summary')
+  async getStrategyAccountSummary(@Param('strategyId') strategyId: string) {
+    if (strategyId !== 'STRAT_A' && strategyId !== 'STRAT_B' && strategyId !== 'STRAT_C') {
+      throw new NotFoundException('strategy not found');
+    }
+    return this.runsService.getStrategyAccountSummary(strategyId);
+  }
+
+  @Post('maintenance/purge-invalid-fills')
+  purgeInvalidFills() {
+    return this.runsService.purgeInvalidFillEvents();
+  }
+
   @Get('history')
   getHistory(
     @Query('strategyId') strategyId?: 'STRAT_A' | 'STRAT_B' | 'STRAT_C',

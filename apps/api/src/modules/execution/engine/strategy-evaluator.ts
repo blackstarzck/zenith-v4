@@ -1,9 +1,9 @@
+import { buildExitSequence, buildLongEntrySequence, type StrategyEventDecision } from './execution-sequence';
 import type { StrategyId } from './strategy-config';
 import type {
   MomentumConfig,
   MomentumState,
-  StrategyCandle,
-  StrategyEventDecision
+  StrategyCandle
 } from './simple-momentum.strategy';
 import { INITIAL_MOMENTUM_STATE } from './simple-momentum.strategy';
 
@@ -12,22 +12,87 @@ export type StrategyEvaluateResult = Readonly<{
   decisions: readonly StrategyEventDecision[];
 }>;
 
+export type StrategyEntryReadiness = Readonly<{
+  entryReadinessPct: number;
+  entryReady: boolean;
+  reason: string;
+  inPosition: boolean;
+}>;
+
+export type StrategyEvaluationDetailed = Readonly<{
+  result: StrategyEvaluateResult;
+  readiness: StrategyEntryReadiness;
+}>;
+
 export function evaluateStrategyCandle(
   strategyId: StrategyId,
   state: MomentumState,
   candle: StrategyCandle,
   config: MomentumConfig
 ): StrategyEvaluateResult {
+  return evaluateStrategyCandleDetailed(strategyId, state, candle, config).result;
+}
+
+export function evaluateStrategyCandleDetailed(
+  strategyId: StrategyId,
+  state: MomentumState,
+  candle: StrategyCandle,
+  config: MomentumConfig
+): StrategyEvaluationDetailed {
   const nextHistory = [...state.recentCandles, candle].slice(-200);
   const stateWithHistory: MomentumState = {
     ...state,
     recentCandles: nextHistory
   };
 
-  if (!state.inPosition) {
-    return evaluateEntry(strategyId, stateWithHistory, candle, config);
+  if (state.inPosition) {
+    return {
+      result: evaluateExit(strategyId, stateWithHistory, candle, config),
+      readiness: {
+        entryReadinessPct: 100,
+        entryReady: false,
+        reason: 'IN_POSITION',
+        inPosition: true
+      }
+    };
   }
-  return evaluateExit(strategyId, stateWithHistory, candle, config);
+
+  const entryResult = evaluateEntry(strategyId, stateWithHistory, candle, config);
+  const entryReady = entryResult.decisions.some((decision) => (
+    decision.eventType === 'ORDER_INTENT' &&
+    String(decision.payload.side ?? '').toUpperCase() === 'BUY'
+  ));
+  if (entryReady) {
+    const signal = entryResult.decisions.find((decision) => decision.eventType === 'SIGNAL_EMIT');
+    return {
+      result: entryResult,
+      readiness: {
+        entryReadinessPct: 100,
+        entryReady: true,
+        reason: String(signal?.payload.reason ?? 'ENTRY_READY'),
+        inPosition: false
+      }
+    };
+  }
+
+  return {
+    result: entryResult,
+    readiness: {
+      entryReadinessPct: capWaitingReadiness(computeEntryReadinessPct(strategyId, stateWithHistory, candle, config)),
+      entryReady: false,
+      reason: 'ENTRY_WAIT',
+      inPosition: false
+    }
+  };
+}
+
+export function evaluateStrategyEntryReadiness(
+  strategyId: StrategyId,
+  state: MomentumState,
+  candle: StrategyCandle,
+  config: MomentumConfig
+): StrategyEntryReadiness {
+  return evaluateStrategyCandleDetailed(strategyId, state, candle, config).readiness;
 }
 
 function evaluateEntry(
@@ -54,7 +119,7 @@ function evaluateExit(
   const entry = state.entryPrice;
   if (typeof entry !== 'number' || entry <= 0) {
     return {
-      nextState: INITIAL_MOMENTUM_STATE,
+      nextState: buildFlatStateAfterExit(strategyId, state),
       decisions: []
     };
   }
@@ -79,45 +144,17 @@ function evaluateExit(
   }
 
   const reason = shouldTakeProfit ? 'TP' : shouldStopLoss ? 'SL' : 'TIME';
-  const decisions: StrategyEventDecision[] = [
-    {
-      eventType: 'EXIT',
-      payload: {
+  return {
+    nextState: buildFlatStateAfterExit(strategyId, state),
+    decisions: buildExitSequence({
+      price: candle.close,
+      orderReason: `EXIT_${reason}`,
+      exitPayload: {
         reason,
         pnlPct: round(pnlPct),
         barsHeld
       }
-    },
-    {
-      eventType: 'ORDER_INTENT',
-      payload: {
-        side: 'SELL',
-        qty: 1,
-        price: candle.close,
-        reason: `EXIT_${reason}`
-      }
-    },
-    {
-      eventType: 'FILL',
-      payload: {
-        side: 'SELL',
-        qty: 1,
-        fillPrice: candle.close
-      }
-    },
-    {
-      eventType: 'POSITION_UPDATE',
-      payload: {
-        side: 'FLAT',
-        qty: 0,
-        realizedPnlPct: round(pnlPct)
-      }
-    }
-  ];
-
-  return {
-    nextState: INITIAL_MOMENTUM_STATE,
-    decisions
+    })
   };
 }
 
@@ -321,38 +358,10 @@ function buildEntryResult(
   reason: string
 ): StrategyEvaluateResult {
   const decisions: StrategyEventDecision[] = [
-    {
-      eventType: 'SIGNAL_EMIT',
-      payload: {
-        signal: 'LONG_ENTRY',
-        reason
-      }
-    },
-    {
-      eventType: 'ORDER_INTENT',
-      payload: {
-        side: 'BUY',
-        qty: 1,
-        price: candle.close,
-        reason
-      }
-    },
-    {
-      eventType: 'FILL',
-      payload: {
-        side: 'BUY',
-        qty: 1,
-        fillPrice: candle.close
-      }
-    },
-    {
-      eventType: 'POSITION_UPDATE',
-      payload: {
-        side: 'LONG',
-        qty: 1,
-        avgEntry: candle.close
-      }
-    }
+    ...buildLongEntrySequence({
+      price: candle.close,
+      orderReason: reason
+    })
   ];
 
   return {
@@ -366,6 +375,208 @@ function buildEntryResult(
     },
     decisions
   };
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function toPct(value: number): number {
+  return Math.round(clamp(value, 0, 100));
+}
+
+function capWaitingReadiness(value: number): number {
+  return Math.min(99, toPct(value));
+}
+
+function computeEntryReadinessPct(
+  strategyId: StrategyId,
+  state: MomentumState,
+  candle: StrategyCandle,
+  config: MomentumConfig
+): number {
+  if (strategyId === 'STRAT_A' && config.stratA) {
+    const closes = state.recentCandles.map((item) => item.close);
+    const bb = bollinger(closes, config.stratA.bbPeriod, config.stratA.bbStd);
+    const adx = adxValue(state.recentCandles, config.stratA.adxPeriod);
+    const rsiNow = rsiValue(closes, config.stratA.rsiPeriod);
+    const rsiPast = rsiValue(closes.slice(0, -config.stratA.rsiSlopeLookback), config.stratA.rsiPeriod);
+    if (!bb || typeof adx !== 'number' || typeof rsiNow !== 'number' || typeof rsiPast !== 'number') {
+      return 0;
+    }
+    const lowerDistPct = bb.lower > 0 ? Math.abs(candle.close - bb.lower) / bb.lower : 1;
+    const reclaimBonus = candle.low <= bb.lower && candle.close > bb.lower ? 20 : 0;
+    const adxScore = clamp((config.stratA.maxAdx - adx) / Math.max(1, config.stratA.maxAdx), 0, 1) * 30;
+    const rsiSlope = rsiNow - rsiPast;
+    const slopeScore = clamp((rsiSlope - config.stratA.rsiSlopeMin + 2) / 4, 0, 1) * 30;
+    const distScore = clamp(1 - lowerDistPct * 50, 0, 1) * 20;
+    return toPct(adxScore + slopeScore + distScore + reclaimBonus);
+  }
+
+  if (strategyId === 'STRAT_B' && config.stratB) {
+    const activeReadiness = computeStratBActivePoiReadiness(state, candle, config.stratB);
+    if (activeReadiness > 0) {
+      return activeReadiness;
+    }
+    return computeStratBRecentImpulseReadiness(state.recentCandles, candle, config.stratB);
+  }
+
+  if (config.stratC) {
+    const stratC = config.stratC;
+    const kstHour = toKstHour(candle.time);
+    const isAllowedHour = stratC.allowedHoursKst.includes(kstHour);
+    const beforeCurrent = state.recentCandles.slice(0, -1);
+    const breakoutRange = beforeCurrent.slice(-stratC.breakoutLookbackCandles);
+    if (breakoutRange.length === 0) {
+      return 0;
+    }
+    const prevHigh = Math.max(...breakoutRange.map((item) => item.high));
+    const breakoutRatio = prevHigh > 0 ? candle.close / prevHigh : 0;
+    const breakoutScore = clamp((breakoutRatio - 0.97) / 0.03, 0, 1) * 70;
+    const valueSeries = beforeCurrent.slice(-stratC.valueSpikeLookbackCandles).map(candleValueProxy);
+    const avgValue = average(valueSeries);
+    const currentValue = candleValueProxy(candle);
+    const valueRatio = avgValue > 0 ? currentValue / avgValue : 0;
+    const valueScore = clamp((valueRatio - 0.8) / Math.max(0.001, stratC.valueSpikeMult - 0.8), 0, 1) * 30;
+    const readiness = toPct(breakoutScore + valueScore);
+    return isAllowedHour ? readiness : Math.min(readiness, 89);
+  }
+
+  return 0;
+}
+
+function buildFlatStateAfterExit(strategyId: StrategyId, state: MomentumState): MomentumState {
+  const baseState: MomentumState = {
+    inPosition: false,
+    barsHeld: 0,
+    recentCandles: state.recentCandles
+  };
+
+  if (strategyId === 'STRAT_B' && state.stratB) {
+    return {
+      ...baseState,
+      stratB: state.stratB
+    };
+  }
+
+  return baseState;
+}
+
+function computeStratBActivePoiReadiness(
+  state: MomentumState,
+  candle: StrategyCandle,
+  stratB: NonNullable<MomentumConfig['stratB']>
+): number {
+  const poiLow = state.stratB?.poiLow;
+  const poiHigh = state.stratB?.poiHigh;
+  const poiExpiresAt = state.stratB?.poiExpiresAt;
+  if (
+    typeof poiLow !== 'number' ||
+    typeof poiHigh !== 'number' ||
+    (typeof poiExpiresAt === 'number' && candle.time > poiExpiresAt)
+  ) {
+    return 0;
+  }
+
+  const high = Math.max(poiHigh, poiLow);
+  const low = Math.min(poiHigh, poiLow);
+  const touched = candle.low <= high && candle.high >= low;
+  if (touched) {
+    return toPct(candle.close > candle.open ? 100 : 85);
+  }
+
+  const nearest = candle.close > high ? high : low;
+  const distPct = nearest > 0 ? Math.abs(candle.close - nearest) / nearest : 1;
+  const distScore = clamp(1 - distPct * 40, 0, 1) * 70;
+  const freshnessScore = typeof poiExpiresAt === 'number'
+    ? clamp((poiExpiresAt - candle.time) / Math.max(60, stratB.poiValidBars * 60), 0, 1) * 30
+    : 10;
+  return toPct(distScore + freshnessScore);
+}
+
+function computeStratBRecentImpulseReadiness(
+  history: readonly StrategyCandle[],
+  candle: StrategyCandle,
+  stratB: NonNullable<MomentumConfig['stratB']>
+): number {
+  if (history.length < 2) {
+    return 0;
+  }
+
+  const maxCandidateBars = Math.max(stratB.poiValidBars, stratB.obLookback * 2);
+  const startIndex = Math.max(1, history.length - maxCandidateBars);
+  let bestScore = 0;
+
+  for (let signalIndex = startIndex; signalIndex < history.length; signalIndex += 1) {
+    const impulseCandle = history[signalIndex - 1];
+    if (!impulseCandle) {
+      continue;
+    }
+
+    const candidateHistory = history.slice(0, signalIndex + 1);
+    const atr = resolveStratBReadinessAtr(candidateHistory, stratB.atrPeriod);
+    if (typeof atr !== 'number' || atr <= 0) {
+      continue;
+    }
+
+    const range = Math.max(0, impulseCandle.high - impulseCandle.low);
+    const rangeScore = clamp(range / Math.max(1e-9, atr * Math.max(0.0001, stratB.impulseMult)), 0, 1);
+    const bodyScore = clamp(bodyRatio(impulseCandle) / Math.max(0.0001, stratB.impulseBodyRatioMin), 0, 1);
+    const bullishCloseScore = clamp(
+      (impulseCandle.close - impulseCandle.low) / Math.max(impulseCandle.high - impulseCandle.low, 1e-9),
+      0,
+      1
+    );
+    const strength = (rangeScore * 0.45) + (bodyScore * 0.35) + (bullishCloseScore * 0.20);
+    if (strength <= 0) {
+      continue;
+    }
+
+    const segment = history.slice(Math.max(0, signalIndex - 1 - stratB.obLookback), signalIndex - 1);
+    const poiLow = segment.length > 0 ? Math.min(...segment.map((item) => item.low)) : impulseCandle.low;
+    const poiHigh = impulseCandle.high;
+    const high = Math.max(poiHigh, poiLow);
+    const low = Math.min(poiHigh, poiLow);
+    const touched = candle.low <= high && candle.high >= low;
+    const nearest = candle.close > high ? high : low;
+    const distPct = nearest > 0 ? Math.abs(candle.close - nearest) / nearest : 1;
+    const distScore = clamp(1 - distPct * 40, 0, 1);
+    const ageBars = history.length - signalIndex;
+    const ageScore = clamp(1 - ageBars / Math.max(1, stratB.poiValidBars), 0, 1);
+    const score = touched && strength >= 0.6
+      ? toPct(candle.close > candle.open ? 100 : 85)
+      : toPct((strength * 45) + (distScore * 35) + (ageScore * 20) + (touched ? 10 : 0));
+    bestScore = Math.max(bestScore, score);
+  }
+
+  return bestScore;
+}
+
+function resolveStratBReadinessAtr(candles: readonly StrategyCandle[], period: number): number | undefined {
+  const atr = atrValue(candles, period);
+  if (typeof atr === 'number') {
+    return atr;
+  }
+
+  if (candles.length < 2) {
+    return undefined;
+  }
+
+  const tr: number[] = [];
+  for (let i = 1; i < candles.length; i += 1) {
+    const prev = candles[i - 1];
+    const curr = candles[i];
+    if (!prev || !curr) {
+      continue;
+    }
+    tr.push(Math.max(
+      curr.high - curr.low,
+      Math.abs(curr.high - prev.close),
+      Math.abs(curr.low - prev.close)
+    ));
+  }
+
+  return tr.length > 0 ? average(tr) : undefined;
 }
 
 function bollinger(

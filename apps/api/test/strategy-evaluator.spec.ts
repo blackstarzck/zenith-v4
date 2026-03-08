@@ -1,6 +1,6 @@
 import * as assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { evaluateStrategyCandle } from '../src/modules/execution/engine/strategy-evaluator';
+import { evaluateStrategyCandle, evaluateStrategyEntryReadiness } from '../src/modules/execution/engine/strategy-evaluator';
 import { INITIAL_MOMENTUM_STATE } from '../src/modules/execution/engine/simple-momentum.strategy';
 import { resolveStrategyConfig } from '../src/modules/execution/engine/strategy-config';
 
@@ -26,7 +26,12 @@ test('STRAT_A enters on mean-reversion style candle', () => {
     low: 99.85,
     close: 100.25
   }, cfg.momentum);
-  assert.equal(confirm.decisions.some((d) => d.eventType === 'ORDER_INTENT'), true);
+  assert.deepEqual(confirm.decisions.map((decision) => decision.eventType), [
+    'SIGNAL_EMIT',
+    'ORDER_INTENT',
+    'FILL',
+    'POSITION_UPDATE'
+  ]);
 });
 
 test('STRAT_A blocks excluded entry hour (KST 13시)', () => {
@@ -103,6 +108,77 @@ test('STRAT_B POI expires by validBars', () => {
     close: 100.5
   }, cfg.momentum);
   assert.equal(expired.decisions.length, 0);
+});
+
+test('STRAT_B keeps recent candles and POI context after exit', () => {
+  const cfg = resolveStrategyConfig('STRAT_B');
+  const seeded = {
+    inPosition: true,
+    entryPrice: 100,
+    entryTime: 20,
+    barsHeld: 0,
+    recentCandles: Array.from({ length: 20 }, (_, i) => ({
+      time: i + 1,
+      open: 100,
+      high: 100.15,
+      low: 99.95,
+      close: 100.03
+    })),
+    stratB: { poiLow: 99.95, poiHigh: 100.8, poiExpiresAt: 4000 }
+  };
+
+  const exited = evaluateStrategyCandle(cfg.strategyId, seeded, {
+    time: 21,
+    open: 100.2,
+    high: 100.4,
+    low: 100.1,
+    close: 100.3
+  }, cfg.momentum);
+
+  assert.equal(exited.nextState.inPosition, false);
+  assert.equal(exited.nextState.recentCandles.length, 21);
+  assert.equal(exited.nextState.stratB?.poiHigh, 100.8);
+  assert.deepEqual(exited.decisions.map((decision) => decision.eventType), [
+    'EXIT',
+    'ORDER_INTENT',
+    'FILL',
+    'POSITION_UPDATE'
+  ]);
+});
+
+test('STRAT_B readiness uses recent impulse candidate without persisted POI state', () => {
+  const cfg = resolveStrategyConfig('STRAT_B');
+  const seeded = {
+    ...INITIAL_MOMENTUM_STATE,
+    recentCandles: [
+      ...Array.from({ length: 20 }, (_, i) => ({
+        time: i + 1,
+        open: 100,
+        high: 100.15,
+        low: 99.95,
+        close: 100.03
+      })),
+      {
+        time: 21,
+        open: 100.0,
+        high: 100.8,
+        low: 99.95,
+        close: 100.7
+      }
+    ]
+  };
+
+  const readiness = evaluateStrategyEntryReadiness(cfg.strategyId, seeded, {
+    time: 22,
+    open: 100.82,
+    high: 100.86,
+    low: 100.81,
+    close: 100.84
+  }, cfg.momentum);
+
+  assert.equal(readiness.entryReadinessPct > 0, true);
+  assert.equal(readiness.entryReadinessPct < 100, true);
+  assert.equal(readiness.entryReady, false);
 });
 
 test('STRAT_C breakout+value spike+ratio filters trigger entry', () => {
