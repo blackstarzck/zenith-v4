@@ -1,4 +1,11 @@
 import { buildExitSequence, buildLongEntrySequence, type StrategyEventDecision } from './execution-sequence';
+import type {
+  OrderbookTop,
+  StratAState,
+  StratBState,
+  StratCState,
+  StrategyPositionSnapshot
+} from './shared/market-types';
 
 export type StrategyCandle = Readonly<{
   time: number;
@@ -6,6 +13,10 @@ export type StrategyCandle = Readonly<{
   high: number;
   low: number;
   close: number;
+  volume?: number | undefined;
+  tradeValue?: number | undefined;
+  buyValue?: number | undefined;
+  buyRatio?: number | undefined;
 }>;
 
 export type MomentumConfig = Readonly<{
@@ -13,7 +24,12 @@ export type MomentumConfig = Readonly<{
   takeProfitPct: number;
   stopLossPct: number;
   maxHoldBars: number;
+  orderKrw?: number | undefined;
+  feePerSide?: number | undefined;
+  slippageRate?: number | undefined;
   stratA?: Readonly<{
+    entryAfterConfirmFill?: 'ON_CLOSE' | 'NEXT_OPEN' | undefined;
+    partialExitFillTiming?: 'NEXT_OPEN' | 'INTRABAR_APPROX' | undefined;
     bbPeriod: number;
     bbStd: number;
     atrPeriod: number;
@@ -32,6 +48,10 @@ export type MomentumConfig = Readonly<{
     stopMultVolatile: number;
   }>;
   stratB?: Readonly<{
+    requireUserConfirm?: boolean | undefined;
+    approvalDelayBars?: number | undefined;
+    fillWhenAuto?: 'ON_CLOSE' | 'NEXT_OPEN' | undefined;
+    fillWhenSemiAuto?: 'NEXT_OPEN' | undefined;
     atrPeriod: number;
     impulseMult: number;
     impulseBodyRatioMin: number;
@@ -39,6 +59,11 @@ export type MomentumConfig = Readonly<{
     obLookback: number;
     slBuffer: number;
     tpRrFallback: number;
+    trendlineLookback?: number | undefined;
+    bullModeLookback?: number | undefined;
+    bullModeMinClosesAboveTrend?: number | undefined;
+    fvgMinGapPct?: number | undefined;
+    timeExitBars?: number | undefined;
   }>;
   stratC?: Readonly<{
     allowedHoursKst: readonly number[];
@@ -47,29 +72,36 @@ export type MomentumConfig = Readonly<{
     valueSpikeMult: number;
     buyRatioMin: number;
     bodyRatioMin: number;
+    fixedOrderKrw?: number | undefined;
     tp1Pct: number;
+    tp1Ratio?: number | undefined;
     tp2Pct: number;
+    tp2Ratio?: number | undefined;
     slPct: number;
     timeStopMinutes: number;
+    cooldownMinutes?: number | undefined;
+    cooldownAfterStopMinutes?: number | undefined;
+    pauseMinutes?: number | undefined;
+    pauseAfterConsecutiveStops?: number | undefined;
   }>;
 }>;
 
 export type MomentumState = Readonly<{
   inPosition: boolean;
-  entryPrice?: number;
-  entryTime?: number;
-  positionQty?: number;
-  entryNotionalKrw?: number;
+  entryPrice?: number | undefined;
+  entryTime?: number | undefined;
+  positionQty?: number | undefined;
+  entryNotionalKrw?: number | undefined;
   barsHeld: number;
   recentCandles: readonly StrategyCandle[];
-  stratA?: Readonly<{
-    pendingConfirmAt?: number;
-  }>;
-  stratB?: Readonly<{
-    poiLow?: number;
-    poiHigh?: number;
-    poiExpiresAt?: number;
-  }>;
+  candles15m?: readonly StrategyCandle[] | undefined;
+  candles1h?: readonly StrategyCandle[] | undefined;
+  lastPrice?: number | undefined;
+  lastOrderbook?: OrderbookTop | undefined;
+  position?: StrategyPositionSnapshot | undefined;
+  stratA?: StratAState | undefined;
+  stratB?: StratBState | undefined;
+  stratC?: StratCState | undefined;
 }>;
 
 export type EvaluateResult = Readonly<{
@@ -87,7 +119,11 @@ export const DEFAULT_MOMENTUM_CONFIG: MomentumConfig = Object.freeze({
 export const INITIAL_MOMENTUM_STATE: MomentumState = Object.freeze({
   inPosition: false,
   barsHeld: 0,
-  recentCandles: []
+  recentCandles: [],
+  stratC: {
+    stage: 'IDLE' as const,
+    consecutiveStops: 0
+  }
 });
 
 export function evaluateMomentumCandle(

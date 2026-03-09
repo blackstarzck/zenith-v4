@@ -8,8 +8,14 @@ import { computeEntryOrderSizing } from '../../../common/trading-risk';
 import { evaluateEntryBlock, onEntryAccepted, onExitPnl, type RiskConfig } from './risk-guard';
 import type { RuntimeCandle } from './realtime-candle-state';
 import { transitionStrategyRuntimeMode } from './strategy-runtime-mode-machine';
-import { evaluateStrategyCandleDetailed } from './strategy-evaluator';
+import { evaluateStrategyEventDetailed } from './strategy-evaluator';
 import type { MomentumState } from './simple-momentum.strategy';
+import type {
+  OrderbookTop,
+  RealtimePriceTick,
+  StrategyMarketEvent,
+  TimeframeKey
+} from './shared/market-types';
 import type {
   StrategyRuntimeMode,
   StrategyRuntimeState
@@ -45,164 +51,70 @@ type EntryReadinessPayload = Readonly<{
 }>;
 
 export class StrategyRuntimeProcessor {
+  private readonly lastEntryReadinessSignatureByRun = new Map<string, string>();
+
   constructor(private readonly options: StrategyRuntimeProcessorOptions) {}
 
   async processClosedCandle(
     runtime: StrategyRuntimeState,
     candle: RuntimeCandle,
+    eventTsMs: number,
+    timeframe: TimeframeKey = '1m'
+  ): Promise<void> {
+    await this.processStrategyEvent(runtime, {
+      type: 'CANDLE_CLOSE',
+      timeframe,
+      candle
+    }, candle, eventTsMs);
+  }
+
+  async processCandleOpen(
+    runtime: StrategyRuntimeState,
+    candle: RuntimeCandle,
+    eventTsMs: number,
+    timeframe: TimeframeKey = '1m'
+  ): Promise<void> {
+    await this.processStrategyEvent(runtime, {
+      type: 'CANDLE_OPEN',
+      timeframe,
+      candle
+    }, candle, eventTsMs);
+  }
+
+  async processTradeTick(
+    runtime: StrategyRuntimeState,
+    tick: RealtimePriceTick,
+    candle: RuntimeCandle,
     eventTsMs: number
   ): Promise<void> {
-    syncStrategyRuntimeLifecycleState(runtime, this.options.mode);
+    await this.processStrategyEvent(runtime, {
+      type: 'TRADE_TICK',
+      tick
+    }, candle, eventTsMs);
+  }
 
-    if (runtime.lifecycleState === 'WAITING_APPROVAL') {
-      const approvalTransition = transitionStrategyRuntimeMode({
-        mode: this.options.mode,
-        currentState: runtime.lifecycleState,
-        trigger: {
-          type: 'APPROVAL_TICK',
-          approvalConsumed: this.options.consumeApproval(runtime.runId)
-        }
-      });
-      if (approvalTransition.action === 'EMIT_AWAITING_APPROVAL') {
-        await this.emitEntryReadiness(runtime, eventTsMs, candle, {
-          entryReadinessPct: 100,
-          entryReady: true,
-          entryExecutable: false,
-          reason: approvalTransition.reason,
-          inPosition: false
-        });
-        return;
-      }
-      if (approvalTransition.action === 'EXECUTE_APPROVED_ENTRY') {
-        await this.emitSemiAutoApprovedEntry(runtime, candle, eventTsMs);
-        syncStrategyRuntimeLifecycleState(runtime, this.options.mode);
-      }
-      await this.emitEntryReadiness(runtime, eventTsMs, candle, {
-        entryReadinessPct: 100,
-        entryReady: false,
-        entryExecutable: false,
-        reason: this.readinessReasonForLifecycle(runtime),
-        inPosition: runtime.strategyState.inPosition
-      });
-      return;
-    }
+  async processTicker(
+    runtime: StrategyRuntimeState,
+    tick: RealtimePriceTick,
+    candle: RuntimeCandle,
+    eventTsMs: number
+  ): Promise<void> {
+    await this.processStrategyEvent(runtime, {
+      type: 'TICKER',
+      tick
+    }, candle, eventTsMs);
+  }
 
-    if (!runtime.strategyState.inPosition && this.options.e2eForceSemiAutoSignal) {
-      const forceTransition = transitionStrategyRuntimeMode({
-        mode: this.options.mode,
-        currentState: runtime.lifecycleState,
-        trigger: {
-          type: 'FORCE_SEMI_AUTO_SIGNAL'
-        }
-      });
-      if (forceTransition.action === 'REQUEST_SEMI_AUTO_APPROVAL') {
-        await this.requestSemiAutoApproval(runtime, candle, eventTsMs, {
-          suggestedPrice: candle.close,
-          signalPayload: {
-            signal: 'LONG_ENTRY',
-            reason: 'E2E_FORCE_SEMI_AUTO_SIGNAL'
-          }
-        });
-        return;
-      }
-    }
-
-    const detailed = evaluateStrategyCandleDetailed(runtime.strategyId, runtime.strategyState, candle, runtime.momentum);
-    const result = detailed.result;
-    const isEntrySignal = result.decisions.some((decision) => decision.eventType === 'SIGNAL_EMIT');
-    const readiness = detailed.readiness;
-    let entryExecutable = false;
-    let nextState = result.nextState;
-    let executableDecisions = result.decisions;
-
-    if (!runtime.strategyState.inPosition && isEntrySignal) {
-      const approvalRequestTransition = transitionStrategyRuntimeMode({
-        mode: this.options.mode,
-        currentState: runtime.lifecycleState,
-        trigger: {
-          type: 'STRATEGY_ENTRY_SIGNAL'
-        }
-      });
-      if (approvalRequestTransition.action === 'REQUEST_SEMI_AUTO_APPROVAL') {
-      const signal = result.decisions.find((decision) => decision.eventType === 'SIGNAL_EMIT');
-        await this.requestSemiAutoApproval(runtime, candle, eventTsMs, {
-          suggestedPrice: candle.close,
-          ...(signal ? { signalPayload: signal.payload } : {})
-        });
-        return;
-      }
-    }
-
-    if (!runtime.strategyState.inPosition && this.isEntryDecisions(result.decisions)) {
-      const directEntryTransition = transitionStrategyRuntimeMode({
-        mode: this.options.mode,
-        currentState: runtime.lifecycleState,
-        trigger: {
-          type: 'ENTRY_INTENT_READY'
-        }
-      });
-      if (directEntryTransition.action === 'PROCESS_DIRECT_ENTRY') {
-        const blockReason = this.evaluateEntryBlockReason(runtime, eventTsMs);
-        if (blockReason) {
-          await this.emitRiskBlock(runtime, blockReason, eventTsMs, candle);
-          await this.emitEntryReadiness(runtime, eventTsMs, candle, {
-            entryReadinessPct: readiness.entryReadinessPct,
-            entryReady: readiness.entryReady,
-            entryExecutable: false,
-            reason: blockReason,
-            inPosition: false
-          });
-          return;
-        }
-        const preparedEntry = await this.prepareEntryExecution(runtime, result.decisions);
-        if (!preparedEntry) {
-          await this.emitRiskBlock(runtime, 'ENTRY_SIZE_INVALID', eventTsMs, candle);
-          await this.emitEntryReadiness(runtime, eventTsMs, candle, {
-            entryReadinessPct: readiness.entryReadinessPct,
-            entryReady: false,
-            entryExecutable: false,
-            reason: 'ENTRY_SIZE_INVALID',
-            inPosition: false
-          });
-          return;
-        }
-        executableDecisions = preparedEntry.decisions;
-        nextState = {
-          ...result.nextState,
-          positionQty: preparedEntry.qty,
-          entryNotionalKrw: preparedEntry.notionalKrw
-        };
-        entryExecutable = true;
-        this.incrementDailyOrders(runtime, eventTsMs);
-      }
-    }
-
-    if (runtime.strategyState.inPosition && this.isExitDecisions(result.decisions)) {
-      executableDecisions = this.prepareExitExecution(runtime, result.decisions);
-    }
-
-    runtime.strategyState = nextState;
-    syncStrategyRuntimeLifecycleState(runtime, this.options.mode);
-    await this.emitDecisionSequence(runtime, eventTsMs, candle, executableDecisions);
-
-    if (runtime.lifecycleState === 'IN_POSITION') {
-      await this.emitEntryReadiness(runtime, eventTsMs, candle, {
-        entryReadinessPct: 100,
-        entryReady: false,
-        entryExecutable: false,
-        reason: this.readinessReasonForLifecycle(runtime),
-        inPosition: true
-      });
-      return;
-    }
-
-    await this.emitEntryReadiness(runtime, eventTsMs, candle, {
-      entryReadinessPct: readiness.entryReadinessPct,
-      entryReady: readiness.entryReady,
-      entryExecutable: entryExecutable && readiness.entryReady,
-      reason: readiness.reason,
-      inPosition: readiness.inPosition
-    });
+  async processOrderbook(
+    runtime: StrategyRuntimeState,
+    orderbook: OrderbookTop,
+    candle: RuntimeCandle,
+    eventTsMs: number
+  ): Promise<void> {
+    await this.processStrategyEvent(runtime, {
+      type: 'ORDERBOOK',
+      orderbook
+    }, candle, eventTsMs);
   }
 
   async emitSemiAutoApprovedEntry(
@@ -244,10 +156,157 @@ export class StrategyRuntimeProcessor {
       entryTime: candle.time,
       positionQty: sizing.qty,
       entryNotionalKrw: sizing.notionalKrw,
+      position: {
+        qty: sizing.qty,
+        initialQty: sizing.qty,
+        avgEntryPrice: candle.open,
+        entryTime: candle.time,
+        entryNotionalKrw: sizing.notionalKrw,
+        barsHeld: 0,
+        partialExitQty: 0,
+        realizedPnlPct: 0,
+        realizedPnlKrw: 0
+      },
       barsHeld: 0
     };
     delete runtime.pendingSemiAutoEntry;
     syncStrategyRuntimeLifecycleState(runtime, this.options.mode);
+  }
+
+  private async processStrategyEvent(
+    runtime: StrategyRuntimeState,
+    event: StrategyMarketEvent,
+    candle: RuntimeCandle,
+    eventTsMs: number
+  ): Promise<void> {
+    syncStrategyRuntimeLifecycleState(runtime, this.options.mode);
+
+    if (runtime.lifecycleState === 'WAITING_APPROVAL') {
+      if (event.type === 'CANDLE_OPEN' && this.options.consumeApproval(runtime.runId)) {
+        await this.emitSemiAutoApprovedEntry(runtime, candle, eventTsMs);
+        await this.emitEntryReadiness(runtime, eventTsMs, candle, {
+          entryReadinessPct: 100,
+          entryReady: false,
+          entryExecutable: false,
+          reason: this.readinessReasonForLifecycle(runtime),
+          inPosition: runtime.strategyState.inPosition
+        });
+        return;
+      }
+
+      await this.emitEntryReadiness(runtime, eventTsMs, candle, {
+        entryReadinessPct: 100,
+        entryReady: true,
+        entryExecutable: false,
+        reason: 'AWAITING_APPROVAL',
+        inPosition: false
+      });
+      return;
+    }
+
+    if (await this.tryForceSemiAutoApproval(runtime, event, candle, eventTsMs)) {
+      return;
+    }
+
+    const detailed = evaluateStrategyEventDetailed(runtime.strategyId, runtime.strategyState, event, runtime.momentum);
+    let nextState = detailed.result.nextState;
+    let executableDecisions = detailed.result.decisions;
+    let entryExecutable = false;
+
+    const isEntrySignal = !runtime.strategyState.inPosition && detailed.result.decisions.some((decision) => (
+      decision.eventType === 'SIGNAL_EMIT'
+    ));
+
+    if (!runtime.strategyState.inPosition && isEntrySignal && event.type === 'CANDLE_CLOSE') {
+      const approvalRequestTransition = transitionStrategyRuntimeMode({
+        mode: this.options.mode,
+        currentState: runtime.lifecycleState,
+        trigger: {
+          type: 'STRATEGY_ENTRY_SIGNAL'
+        }
+      });
+      if (approvalRequestTransition.action === 'REQUEST_SEMI_AUTO_APPROVAL') {
+        runtime.strategyState = this.toApprovalPendingState(nextState);
+        const signal = detailed.result.decisions.find((decision) => decision.eventType === 'SIGNAL_EMIT');
+        await this.requestSemiAutoApproval(runtime, candle, eventTsMs, {
+          suggestedPrice: candle.close,
+          ...(signal ? { signalPayload: signal.payload } : {})
+        });
+        return;
+      }
+    }
+
+    if (!runtime.strategyState.inPosition && this.isEntryDecisions(detailed.result.decisions)) {
+      const directEntryTransition = transitionStrategyRuntimeMode({
+        mode: this.options.mode,
+        currentState: runtime.lifecycleState,
+        trigger: {
+          type: 'ENTRY_INTENT_READY'
+        }
+      });
+
+      if (directEntryTransition.action === 'PROCESS_DIRECT_ENTRY') {
+        const blockReason = this.evaluateEntryBlockReason(runtime, eventTsMs);
+        runtime.strategyState = nextState;
+        if (blockReason) {
+          syncStrategyRuntimeLifecycleState(runtime, this.options.mode);
+          await this.emitRiskBlock(runtime, blockReason, eventTsMs, candle);
+          await this.emitEntryReadiness(runtime, eventTsMs, candle, {
+            entryReadinessPct: detailed.readiness.entryReadinessPct,
+            entryReady: detailed.readiness.entryReady,
+            entryExecutable: false,
+            reason: blockReason,
+            inPosition: false
+          });
+          return;
+        }
+
+        const preparedEntry = await this.prepareEntryExecution(runtime, detailed.result.decisions, nextState);
+        if (!preparedEntry) {
+          await this.emitRiskBlock(runtime, 'ENTRY_SIZE_INVALID', eventTsMs, candle);
+          await this.emitEntryReadiness(runtime, eventTsMs, candle, {
+            entryReadinessPct: detailed.readiness.entryReadinessPct,
+            entryReady: false,
+            entryExecutable: false,
+            reason: 'ENTRY_SIZE_INVALID',
+            inPosition: false
+          });
+          return;
+        }
+
+        executableDecisions = preparedEntry.decisions;
+        nextState = preparedEntry.nextState;
+        entryExecutable = true;
+        this.incrementDailyOrders(runtime, eventTsMs);
+      }
+    }
+
+    if (runtime.strategyState.inPosition && this.isExitDecisions(detailed.result.decisions)) {
+      executableDecisions = this.prepareExitExecution(runtime, detailed.result.decisions);
+    }
+
+    runtime.strategyState = nextState;
+    syncStrategyRuntimeLifecycleState(runtime, this.options.mode);
+
+    if (executableDecisions.length > 0) {
+      await this.emitDecisionSequence(runtime, eventTsMs, candle, executableDecisions);
+    }
+
+    if (
+      event.type !== 'CANDLE_CLOSE' &&
+      event.type !== 'CANDLE_OPEN' &&
+      executableDecisions.length === 0
+    ) {
+      return;
+    }
+
+    await this.emitEntryReadiness(runtime, eventTsMs, candle, {
+      entryReadinessPct: detailed.readiness.entryReadinessPct,
+      entryReady: detailed.readiness.entryReady,
+      entryExecutable: entryExecutable && detailed.readiness.entryReady,
+      reason: runtime.strategyState.inPosition ? this.readinessReasonForLifecycle(runtime) : detailed.readiness.reason,
+      inPosition: runtime.strategyState.inPosition
+    });
   }
 
   private async requestSemiAutoApproval(
@@ -282,12 +341,60 @@ export class StrategyRuntimeProcessor {
     });
   }
 
+  private async tryForceSemiAutoApproval(
+    runtime: StrategyRuntimeState,
+    event: StrategyMarketEvent,
+    candle: RuntimeCandle,
+    eventTsMs: number
+  ): Promise<boolean> {
+    if (
+      !this.options.e2eForceSemiAutoSignal ||
+      this.options.mode !== 'SEMI_AUTO' ||
+      runtime.strategyId !== 'STRAT_B' ||
+      runtime.lifecycleState !== 'FLAT' ||
+      runtime.strategyState.inPosition ||
+      runtime.pendingSemiAutoEntry ||
+      event.type !== 'CANDLE_OPEN' ||
+      event.timeframe !== '1m'
+    ) {
+      return false;
+    }
+
+    const transition = transitionStrategyRuntimeMode({
+      mode: this.options.mode,
+      currentState: runtime.lifecycleState,
+      trigger: {
+        type: 'FORCE_SEMI_AUTO_SIGNAL'
+      }
+    });
+    if (transition.action !== 'REQUEST_SEMI_AUTO_APPROVAL') {
+      return false;
+    }
+
+    runtime.strategyState = this.toApprovalPendingState(runtime.strategyState);
+    await this.requestSemiAutoApproval(runtime, candle, eventTsMs, {
+      suggestedPrice: candle.open,
+      signalPayload: {
+        signal: 'LONG_ENTRY',
+        reason: 'E2E_FORCE_SEMI_AUTO_SIGNAL',
+        forced: true
+      }
+    });
+    return true;
+  }
+
   private async emitEntryReadiness(
     runtime: StrategyRuntimeState,
     eventTsMs: number,
     candle: RuntimeCandle,
     payload: EntryReadinessPayload
   ): Promise<void> {
+    const nextSignature = buildEntryReadinessSignature(candle, payload);
+    if (this.lastEntryReadinessSignatureByRun.get(runtime.runId) === nextSignature) {
+      return;
+    }
+
+    this.lastEntryReadinessSignatureByRun.set(runtime.runId, nextSignature);
     await this.options.emitStrategyEvent(runtime, 'ENTRY_READINESS', eventTsMs, candle, payload);
   }
 
@@ -319,11 +426,11 @@ export class StrategyRuntimeProcessor {
 
   private async prepareEntryExecution(
     runtime: StrategyRuntimeState,
-    decisions: readonly StrategyEventDecision[]
+    decisions: readonly StrategyEventDecision[],
+    nextState: MomentumState
   ): Promise<Readonly<{
     decisions: readonly StrategyEventDecision[];
-    qty: number;
-    notionalKrw: number;
+    nextState: MomentumState;
   }> | undefined> {
     const orderIntent = decisions.find((decision) => (
       decision.eventType === 'ORDER_INTENT' &&
@@ -344,14 +451,13 @@ export class StrategyRuntimeProcessor {
     if (typeof orderPrice !== 'number' || typeof fillPrice !== 'number') {
       return undefined;
     }
+
     const sizing = await this.resolveEntrySizing(runtime, fillPrice);
     if (!sizing) {
       return undefined;
     }
 
     return {
-      qty: sizing.qty,
-      notionalKrw: sizing.notionalKrw,
       decisions: buildLongEntrySequence({
         price: orderPrice,
         qty: sizing.qty,
@@ -360,7 +466,23 @@ export class StrategyRuntimeProcessor {
         ...(signalPayload ? { signalPayload } : {}),
         includeSignal,
         fillPrice
-      })
+      }),
+      nextState: {
+        ...nextState,
+        positionQty: sizing.qty,
+        entryNotionalKrw: sizing.notionalKrw,
+        position: {
+          qty: sizing.qty,
+          initialQty: sizing.qty,
+          avgEntryPrice: fillPrice,
+          entryTime: nextState.entryTime ?? 0,
+          entryNotionalKrw: sizing.notionalKrw,
+          barsHeld: 0,
+          partialExitQty: 0,
+          realizedPnlPct: 0,
+          realizedPnlKrw: 0
+        }
+      }
     };
   }
 
@@ -377,24 +499,26 @@ export class StrategyRuntimeProcessor {
       return decisions;
     }
 
-    const qty = this.resolveRuntimePositionQty(runtime.strategyState);
+    const desiredQty = numberFromPayload(orderIntent.payload.qty) ?? this.resolveRuntimePositionQty(runtime.strategyState);
     const orderPrice = numberFromPayload(orderIntent.payload.price);
     const fillDecision = decisions.find((decision) => decision.eventType === 'FILL');
     const fillPrice = numberFromPayload(fillDecision?.payload.fillPrice) ?? orderPrice;
     const orderReason = typeof orderIntent.payload.reason === 'string'
       ? orderIntent.payload.reason
       : 'EXIT';
-    if (qty <= 0 || typeof orderPrice !== 'number' || typeof fillPrice !== 'number') {
+    const positionPayload = decisions.find((decision) => decision.eventType === 'POSITION_UPDATE')?.payload;
+    if (desiredQty <= 0 || typeof orderPrice !== 'number' || typeof fillPrice !== 'number') {
       return decisions;
     }
 
     return buildExitSequence({
       price: orderPrice,
-      qty,
-      notionalKrw: fillPrice * qty,
+      qty: desiredQty,
+      notionalKrw: fillPrice * desiredQty,
       orderReason,
       exitPayload: exitDecision.payload,
-      fillPrice
+      fillPrice,
+      ...(positionPayload ? { positionPayload } : {})
     });
   }
 
@@ -402,6 +526,19 @@ export class StrategyRuntimeProcessor {
     runtime: StrategyRuntimeState,
     price: number
   ): Promise<Readonly<{ qty: number; notionalKrw: number }> | undefined> {
+    if (runtime.strategyId === 'STRAT_C') {
+      const orderKrw = runtime.momentum.stratC?.fixedOrderKrw ?? runtime.momentum.orderKrw;
+      if (typeof orderKrw === 'number' && Number.isFinite(orderKrw) && orderKrw > 0) {
+        const qty = Math.floor(((orderKrw / price) * 100_000_000) + 1e-9) / 100_000_000;
+        if (qty > 0) {
+          return {
+            qty,
+            notionalKrw: Number((qty * price).toFixed(2))
+          };
+        }
+      }
+    }
+
     let accountBaseKrw = runtime.riskSnapshot.seedKrw;
     try {
       const resolved = await this.options.resolveAccountBaseKrw(runtime);
@@ -420,6 +557,9 @@ export class StrategyRuntimeProcessor {
   }
 
   private resolveRuntimePositionQty(state: MomentumState): number {
+    if (typeof state.position?.qty === 'number' && Number.isFinite(state.position.qty) && state.position.qty > 0) {
+      return state.position.qty;
+    }
     if (typeof state.positionQty === 'number' && Number.isFinite(state.positionQty) && state.positionQty > 0) {
       return state.positionQty;
     }
@@ -480,6 +620,39 @@ export class StrategyRuntimeProcessor {
     }
     return runtime.lifecycleState;
   }
+
+  private toApprovalPendingState(state: MomentumState): MomentumState {
+    return {
+      ...state,
+      inPosition: false,
+      entryPrice: undefined,
+      entryTime: undefined,
+      positionQty: undefined,
+      entryNotionalKrw: undefined,
+      position: undefined,
+      barsHeld: 0,
+      stratB: state.stratB
+        ? {
+          ...state.stratB,
+          stage: 'WAIT_APPROVAL'
+        }
+        : state.stratB
+    };
+  }
+}
+
+function buildEntryReadinessSignature(
+  candle: RuntimeCandle,
+  payload: EntryReadinessPayload
+): string {
+  return [
+    candle.time,
+    payload.entryReadinessPct,
+    payload.entryReady ? 1 : 0,
+    payload.entryExecutable ? 1 : 0,
+    payload.reason,
+    payload.inPosition ? 1 : 0
+  ].join('|');
 }
 
 function numberFromPayload(value: unknown): number | undefined {

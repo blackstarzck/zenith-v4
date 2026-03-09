@@ -178,7 +178,9 @@ export class UpbitRealtimeConnection {
 
     const payload = JSON.stringify([
       { ticket: `zenith-multi-${this.options.market}` },
-      { type: 'trade', codes: [this.options.market], isOnlyRealtime: true }
+      { type: 'trade', codes: [this.options.market], isOnlyRealtime: true },
+      { type: 'ticker', codes: [this.options.market], isOnlyRealtime: true },
+      { type: 'orderbook', codes: [this.options.market], isOnlyRealtime: true }
     ]);
 
     this.socket.send(payload);

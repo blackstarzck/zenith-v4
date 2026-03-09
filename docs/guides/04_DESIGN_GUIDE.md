@@ -19,6 +19,7 @@
 - 상단: “현재 실행 상태(전략/모드/시드/runId/fillModelRequested/fillModelApplied)” 고정
   - fillModelRequested/applied는 결과에 큰 영향을 주므로 UI에서 숨기지 않는다. (계약: `../architecture/06_ARCHITECTURE.md`)
 - 중앙: 차트 + 주문/체결 + 시그널 로그
+  - 라이브 차트는 전략별 핵심 수준선(예: STRAT_B zone/target, STRAT_C breakout level)을 오버레이로 직접 노출한다.
 - 하단: 리포트(성과/리스크) 요약
 
 ---
@@ -80,6 +81,8 @@
 - 체결/주문/리스크 관련 액션은 optimistic update를 기본 금지한다.
 - 서버 ACK 이전에는 "요청됨(Requested)" 상태로만 표시한다.
 - ACK/실패 이벤트를 수신하면 즉시 상태를 확정한다(Confirmed/Failed).
+- 전략/모드 의존 제어값은 유효한 선택지만 노출한다.
+  - 예: STRAT_B `SEMI_AUTO`는 `NEXT_OPEN`만 허용, STRAT_C는 `NEXT_MINUTE_OPEN` 고정, STRAT_A/STRAT_C는 `SEMI_AUTO` 비노출
 
 ### 6.5 접근성/가독성 규칙
 - 실시간 상태 텍스트는 최소 12px 이상, 대비비 4.5:1 이상.

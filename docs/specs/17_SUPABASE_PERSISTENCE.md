@@ -37,6 +37,10 @@
   - `fill_model_requested`, `fill_model_applied`
   - `entry_policy` (jsonb)
   - `dataset_ref` (jsonb)
+- 저장 규칙:
+  - `fill_model_requested`, `fill_model_applied`, `entry_policy`는 `PATCH /runs/:runId/control` 이후에도 최신 값으로 유지돼야 한다.
+  - `entry_policy`는 구조화 JSON으로 저장하되 최소 `key` 필드에 canonical policy string을 보존한다.
+  - 구버전 환경에서 `entry_policy` 컬럼이 아직 없으면 앱은 legacy select/update로 fallback 할 수 있어야 한다.
 
 ### 2.2 `text_run_configs`
 - 용도: runConfig 스냅샷 보관
@@ -173,3 +177,52 @@
   1. apply the `text_fills` schema
   2. run the historical backfill from `text_run_events`
   3. deploy code that reads persisted fills from `text_fills`
+
+# Run artifact persistence addendum (ASCII appendix)
+- As of `2026-03-09`, generated run reports now sync:
+  - `text_trades`
+  - `text_run_reports`
+  - Storage objects in `run-artifacts/<runId>/...`
+- Current behavior:
+  - `GET /runs/:runId/run_report.json` derives the report from accepted runtime events
+  - the service persists `text_runs.dataset_ref` from run control snapshots and generated run reports
+  - the service then replaces persisted `text_trades` rows for that `run_id`
+  - the service then replaces the persisted `text_run_reports` row for that `run_id`
+  - the service then uploads `run_report.json`, `trades.csv`, and `events.jsonl` into `run-artifacts/<runId>/...`
+  - `/reports/benchmark-compare` uses `dataset_ref` to separate provisional `MATCHED` from exact `docClaimEligible=true`
+- Current artifact paths:
+  - `run-artifacts/<runId>/run_report.json`
+  - `run-artifacts/<runId>/trades.csv`
+  - `run-artifacts/<runId>/events.jsonl`
+- Storage upload is best-effort:
+  - DB summary persistence remains the primary path
+  - Storage failure is logged and does not block report generation
+- This addendum is current as of `2026-03-09`.
+- STRAT_B benchmark normalization is complete from the user-provided CSV source.
+- Live runtime E2E verification is complete; see `docs/ops/22A_RUNTIME_E2E_ADDENDUM_2026-03-09.md`.
+
+# Dataset ref persistence addendum (ASCII appendix)
+- `text_runs.dataset_ref` stores the durable dataset snapshot for each run.
+- Required fields:
+  - `key`
+  - `source`
+  - `profile`
+  - `market`
+  - ordered `timeframes`
+  - ordered `feeds`
+  - `dateRangeLabel`
+  - `exact`
+- Legacy Supabase environments may still lack `dataset_ref`.
+- In that case insert/select/patch calls must fall back without failing the run.
+
+# Runtime session shell sync addendum (ASCII appendix)
+- Startup may restore `text_runs` rows from older sessions because run IDs are fixed.
+- The engine must re-sync the restored shell to the current env session for:
+  - `strategy_version`
+  - `mode`
+  - `market`
+  - `fill_model_requested`
+  - `fill_model_applied`
+  - `entry_policy`
+- The goal is to keep the same `runId` while preventing stale `PAPER` mode or stale entry policy from leaking into live `SEMI_AUTO`.
+- Persistence is best-effort; boot continues if the DB write fails after the in-memory sync succeeds.

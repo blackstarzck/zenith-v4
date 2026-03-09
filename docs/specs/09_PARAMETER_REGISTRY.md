@@ -33,7 +33,7 @@
 | key | type | default | allowed/constraint | impact | note |
 |---|---|---:|---|---|---|
 | common.risk.maxPositionRatio | number | 0.20 | 0~1 | HIGH | 계좌 대비 최대 비중 |
-| common.risk.dailyLossLimitPct | number | -0.02 | -1~0 | HIGH | 일 손실 제한(%) |
+| common.risk.dailyLossLimitPct | number | -2 | -100~0 | HIGH | 일 손실 제한(%, `EXIT.pnlPct`와 같은 단위) |
 | common.risk.maxConsecutiveLosses | number | 3 | 1~50 | HIGH | 연속 손실 제한 |
 | common.risk.killSwitch | boolean | true | true/false | HIGH | 긴급정지 |
 | common.risk.maxDailyOrders | number | 200 | 1~5000 | MED | 과도 주문 방지(옵션) |
@@ -45,7 +45,7 @@
 ### 2.1 엔트리 정책(룩어헤드 없음)
 | key | type | default | allowed/constraint | impact | note |
 |---|---|---:|---|---|---|
-| a.entry.afterConfirmFill | enum | ON_CLOSE | ON_CLOSE/NEXT_OPEN | HIGH | Confirm 이후 진입 체결 |
+| a.entry.afterConfirmFill | enum | NEXT_OPEN | ON_CLOSE/NEXT_OPEN | HIGH | Confirm 이후 진입 체결 |
 | a.execution.partialExitFillTiming | enum | NEXT_OPEN | NEXT_OPEN/INTRABAR_APPROX | HIGH | 부분익절 체결 |
 
 ### 2.2 지표/필터
@@ -96,6 +96,10 @@
 | b.ob.lookback | number | 10 | 1~200 | MED | OB 탐색 범위 |
 | b.sl.buffer | number | 0.002 | 0~0.05 | HIGH | SL buffer |
 | b.tp.rrFallback | number | 1.5 | 0.1~10 | MED | fallback RR |
+| b.trendline.lookback | number | 6 | 2~100 | MED | 15m trendline 계산 구간 |
+| b.bullMode.lookback | number | 5 | 3~100 | MED | 1h Bull Mode 판정 구간 |
+| b.bullMode.minClosesAboveTrend | number | 3 | 1~100 | HIGH | Bull Mode 최소 충족 봉 수 |
+| b.fvg.minGapPct | number | 0.001 | 0~0.05 | HIGH | bullish FVG 최소 갭 |
 | b.timeExit.bars | number | 24 | 1~500 | HIGH | TIME EXIT |
 
 ---
@@ -110,6 +114,7 @@
 | c.valueSpike.mult | number | 4.0 | 1~50 | HIGH | mult |
 | c.buyRatio.min | number | 0.75 | 0~1 | HIGH | buy_ratio |
 | c.bodyRatio.min | number | 0.70 | 0~1 | HIGH | body_ratio |
+| c.order.fixedKrw | number | 50000 | >=10000 | HIGH | STRAT_C 기본 고정 주문금액 |
 | c.tp1.pct | number | 0.004 | 0~0.2 | HIGH | TP1 |
 | c.tp1.ratio | number | 0.70 | 0~1 | HIGH | 70% |
 | c.tp2.pct | number | 0.006 | 0~0.2 | HIGH | TP2 |
@@ -124,8 +129,11 @@
 ---
 
 ## 5) Position Sizing Note (ASCII appendix, 2026-03-08)
-- Runtime entry sizing must not fall back to an implicit fixed `qty=1` when `common.seedKrw` and `common.risk.maxPositionRatio` are configured.
-- Account base KRW for entry sizing:
+- Runtime entry sizing must not fall back to an implicit fixed `qty=1`.
+- STRAT_C sizing priority:
+  1. use `c.order.fixedKrw` when it is valid
+  2. otherwise fall back to risk-based sizing
+- STRAT_A/B risk-based sizing:
   1. use the latest strategy account equity when it is available from the merged fill/account summary path
   2. otherwise fall back to `common.seedKrw`
 - Entry target notional KRW = `accountBaseKrw * common.risk.maxPositionRatio`

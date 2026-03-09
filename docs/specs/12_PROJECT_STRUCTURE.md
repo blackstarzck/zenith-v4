@@ -103,6 +103,11 @@ apps/api/src/
       strategy.module.ts
     execution/
       engine/                 # 상태머신/실행 오케스트레이션
+        shared/               # 공통 타입/지표/집계/strategy module contract
+        strategies/
+          strat-a/            # STRAT_A 전용 구현
+          strat-b/            # STRAT_B 전용 구현
+          strat-c/            # STRAT_C 전용 구현
       services/
       dto/
       events/                 # 내부 도메인 이벤트 타입
@@ -172,6 +177,10 @@ apps/api/src/
 ```
 
 ### 3.2 실시간 WS 설계 원칙(심화)
+- 전략 분리 규칙:
+  - 전략 구현은 `execution/engine/strategies/<strategyId>/` 하위에만 둔다.
+  - 전략 간 직접 import를 금지한다.
+  - 공통 로직은 `execution/engine/shared/`로 이동한다.
 - 인입과 송신을 분리한다:
   - 인입: `market-data/ingest` (거래소 WS/REST)
   - 송신: `ws/gateways` (클라이언트 구독 전달)
@@ -184,6 +193,9 @@ apps/api/src/
 - 멱등성/순서:
   - `runId + sequence`를 모든 이벤트에 포함
   - 재전송 시 동일 `sequence`는 중복 처리 금지
+- 멀티전략 fan-out:
+  - 하나의 `trade/ticker/orderbook` 피드에서 3개 전략 런타임으로 fan-out한다.
+  - 각 전략은 별도 `runId`/`strategyState`/`riskState`를 유지하고 shared helper만 공유한다.
 - 채널 설계:
   - `/ws/runs/:runId/events`
   - `/ws/runs/:runId/positions`
@@ -316,3 +328,5 @@ type SystemEventDto = Readonly<{
   - `../architecture/06_ARCHITECTURE.md`, `10_EXPERIMENT_PROTOCOL.md`, `packages/contracts`를 함께 수정한다.
 - DTO 필드 변경 시:
   - 마이그레이션 노트와 버전 표기를 남긴다.
+- 전략 구조 변경 시:
+  - `08_STRATEGIES.md`, `09_PARAMETER_REGISTRY.md`, `06_ARCHITECTURE.md`를 함께 검토한다.

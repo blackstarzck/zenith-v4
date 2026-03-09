@@ -1,19 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Card, Input, Select, Space, Table, Typography } from 'antd';
 import { Link, useSearchParams } from 'react-router-dom';
+import type { RunHistoryItemDto } from '@zenith/contracts';
 import { httpGet } from '../../../shared/api/http';
 
 const { Title, Text } = Typography;
 
-type RunHistoryRow = Readonly<{
-  runId: string;
-  strategyId: 'STRAT_A' | 'STRAT_B' | 'STRAT_C';
-  mode: 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
-  fillModelApplied: 'NEXT_OPEN' | 'ON_CLOSE';
-  entryPolicy: string;
-  eventCount: number;
-  lastEventAt?: string;
-}>;
+type RunHistoryRow = RunHistoryItemDto;
 
 export function RunsHistoryPage() {
   const [searchParams, setSearchParams] = useSearchParams();

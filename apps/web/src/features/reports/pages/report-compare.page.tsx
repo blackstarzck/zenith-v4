@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Card, Segmented, Select, Space, Table, Typography } from 'antd';
+import type { RunMode, StrategyId } from '@zenith/contracts';
 import { httpGet } from '../../../shared/api/http';
 import { UI_COLOR } from '../../../shared/ui/color-semantic';
 
@@ -7,12 +8,12 @@ const { Title } = Typography;
 
 type RunHistoryRow = Readonly<{
   strategyVersion: string;
-  mode: 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
+  mode: RunMode;
   market: string;
 }>;
 
 type CompareSummaryRow = Readonly<{
-  strategyId: 'STRAT_A' | 'STRAT_B' | 'STRAT_C';
+  strategyId: StrategyId;
   runs: number;
   trades: number;
   winRate: number;
@@ -27,7 +28,7 @@ type CompareResponse = Readonly<{
   summary: readonly CompareSummaryRow[];
   trend: readonly Readonly<{
     strategyVersion: string;
-    strategyId: 'STRAT_A' | 'STRAT_B' | 'STRAT_C';
+    strategyId: StrategyId;
     runs: number;
     winRate: number;
     sumReturnPct: number;
@@ -97,7 +98,7 @@ export function ReportComparePage() {
 
   const trendData = useMemo(() => {
     const versions = Array.from(new Set(trendRows.map((row) => row.strategyVersion)));
-    const byStrategy: Record<'STRAT_A' | 'STRAT_B' | 'STRAT_C', Array<{ x: number; y: number }>> = {
+    const byStrategy: Record<StrategyId, Array<{ x: number; y: number }>> = {
       STRAT_A: [],
       STRAT_B: [],
       STRAT_C: []

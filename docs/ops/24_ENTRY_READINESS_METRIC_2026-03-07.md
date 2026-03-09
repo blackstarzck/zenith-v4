@@ -52,3 +52,8 @@
 - Strategy runtime now restores recent candle history on startup, and exit transitions keep indicator history needed for the next readiness calculation.
 - Runs Live client now forces section re-sync when the backend restarts and event `seq` rewinds with a newer timestamp, preventing stale `0%` snapshots from remaining on screen.
 - Waiting-state `ENTRY_READINESS` is capped at `99%`; `100%` is reserved for actual entry-ready states or in-position states to avoid false expectations of immediate fills.
+
+## 2026-03-09 live run scoping fix
+- Runs Live must hydrate each strategy section from the fixed strategy runtime run IDs (`run-strat-a-0001`, `run-strat-b-0001`, `run-strat-c-0001`).
+- Using `/runs/history` to pick the latest historical run per strategy is invalid for the live operator table because it can surface stale `ENTRY_READINESS` from an older run.
+- `WAITING_APPROVAL` 상태에서는 동일 캔들/동일 payload의 `ENTRY_READINESS`를 반복 발행하지 않는다.

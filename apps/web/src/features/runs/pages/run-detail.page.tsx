@@ -1,24 +1,12 @@
 import { useEffect, useState } from 'react';
 import { Alert, Button, Card, Descriptions, Space, Table, Tabs, Typography } from 'antd';
 import { useParams } from 'react-router-dom';
-import type { WsEventEnvelopeDto } from '@zenith/contracts';
+import type { RunDetailDto, RunReportDto } from '@zenith/contracts';
 import { downloadTextFile, httpGet, httpGetText } from '../../../shared/api/http';
 
 const { Title, Paragraph } = Typography;
 
-type RunDetailResponse = Readonly<{
-  runId: string;
-  strategyId: 'STRAT_A' | 'STRAT_B' | 'STRAT_C';
-  mode: 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
-  fillModelRequested: 'AUTO' | 'NEXT_OPEN' | 'ON_CLOSE';
-  fillModelApplied: 'NEXT_OPEN' | 'ON_CLOSE';
-  entryPolicy: string;
-  market: string;
-  eventCount: number;
-  lastSeq: number;
-  lastEventAt?: string;
-  events: WsEventEnvelopeDto[];
-}>;
+type RunDetailResponse = RunDetailDto;
 
 export function RunDetailPage() {
   const { runId } = useParams();
@@ -52,6 +40,12 @@ export function RunDetailPage() {
     downloadTextFile(`${runId}-trades.csv`, content, 'text/csv;charset=utf-8');
   }
 
+  async function downloadRunReport(): Promise<void> {
+    if (!runId) return;
+    const report = await httpGet<RunReportDto>(`/runs/${runId}/run_report.json`);
+    downloadTextFile(`${runId}-run_report.json`, JSON.stringify(report, null, 2), 'application/json;charset=utf-8');
+  }
+
   return (
     <div style={{ padding: 16 }}>
       <Title level={3} style={{ marginTop: 0 }}>실행 상세</Title>
@@ -64,6 +58,7 @@ export function RunDetailPage() {
       <Card
         extra={(
           <Space>
+            <Button onClick={() => void downloadRunReport()}>run_report.json 다운로드</Button>
             <Button onClick={() => void downloadEvents()}>events.jsonl 다운로드</Button>
             <Button onClick={() => void downloadTrades()}>trades.csv 다운로드</Button>
           </Space>

@@ -1,4 +1,5 @@
 import { Body, Controller, Get, Header, NotFoundException, Param, Patch, Post, Query } from '@nestjs/common';
+import type { DatasetRefDto } from '@zenith/contracts';
 import { RunsService } from './runs.service';
 
 @Controller('runs')
@@ -84,6 +85,15 @@ export class RunsController {
     return content;
   }
 
+  @Get(':runId/run_report.json')
+  async getRunReport(@Param('runId') runId: string) {
+    const report = await this.runsService.getRunReport(runId);
+    if (!report) {
+      throw new NotFoundException('run not found');
+    }
+    return report;
+  }
+
   @Get(':runId/candles')
   async getCandles(
     @Param('runId') runId: string,
@@ -115,9 +125,10 @@ export class RunsController {
       strategyVersion?: string;
       mode?: 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
       market?: string;
-      fillModelRequested?: 'AUTO' | 'NEXT_OPEN' | 'ON_CLOSE';
-      fillModelApplied?: 'NEXT_OPEN' | 'ON_CLOSE';
+      fillModelRequested?: 'AUTO' | 'NEXT_OPEN' | 'ON_CLOSE' | 'NEXT_MINUTE_OPEN' | 'INTRABAR_APPROX';
+      fillModelApplied?: 'NEXT_OPEN' | 'ON_CLOSE' | 'NEXT_MINUTE_OPEN' | 'INTRABAR_APPROX';
       entryPolicy?: string;
+      datasetRef?: DatasetRefDto;
     }>
   ) {
     const updated = await this.runsService.updateRunControl(runId, body);

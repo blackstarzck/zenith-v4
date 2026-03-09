@@ -1,45 +1,12 @@
 import { useEffect, useState } from 'react';
 import { Card, Descriptions, Typography } from 'antd';
 import { useParams } from 'react-router-dom';
+import type { RunDetailDto } from '@zenith/contracts';
 import { httpGet } from '../../../shared/api/http';
 
 const { Title } = Typography;
 
-type RunDetailResponse = Readonly<{
-  runId: string;
-  strategyId: 'STRAT_A' | 'STRAT_B' | 'STRAT_C';
-  strategyVersion: string;
-  mode: 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
-  fillModelRequested: 'AUTO' | 'NEXT_OPEN' | 'ON_CLOSE';
-  fillModelApplied: 'NEXT_OPEN' | 'ON_CLOSE';
-  entryPolicy: string;
-  market: string;
-  eventCount: number;
-  lastSeq: number;
-  lastEventAt?: string;
-  runConfig: Readonly<{
-    strategyVersion: string;
-    updatedAt: string;
-    riskSnapshot: Readonly<{
-      seedKrw: number;
-      maxPositionRatio: number;
-      dailyLossLimitPct: number;
-      maxConsecutiveLosses: number;
-      maxDailyOrders: number;
-      killSwitch: boolean;
-    }>;
-  }>;
-  kpi: Readonly<{
-    trades: number;
-    exits: number;
-    winRate: number;
-    sumReturnPct: number;
-    mddPct: number;
-    profitFactor: number;
-    avgWinPct: number;
-    avgLossPct: number;
-  }>;
-}>;
+type RunDetailResponse = RunDetailDto;
 
 export function ReportRunDetailPage() {
   const { runId } = useParams();

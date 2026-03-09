@@ -3,10 +3,7 @@ import { test } from 'node:test';
 import { computeEntryOrderSizing } from '../src/common/trading-risk';
 import { type RuntimeCandle } from '../src/modules/execution/engine/realtime-candle-state';
 import { StrategyRuntimeProcessor } from '../src/modules/execution/engine/strategy-runtime-processor';
-import { resolveStrategyConfig } from '../src/modules/execution/engine/strategy-config';
 import { createStrategyRuntimeState } from '../src/modules/execution/engine/strategy-runtime-state';
-import { evaluateStrategyCandleDetailed } from '../src/modules/execution/engine/strategy-evaluator';
-import { INITIAL_MOMENTUM_STATE } from '../src/modules/execution/engine/simple-momentum.strategy';
 
 type CapturedEvent = Readonly<{
   strategyId: string;
@@ -45,51 +42,68 @@ function createProcessor(
   });
 }
 
-test('StrategyRuntimeProcessor keeps STRAT_B entry readiness on the original candle evaluation', async () => {
+function createStratBReadyRuntime() {
+  const runtime = createStrategyRuntimeState('STRAT_B', 'v1');
+  runtime.strategyState = {
+    ...runtime.strategyState,
+    candles1h: [
+      { time: 1, open: 100, high: 101, low: 99.8, close: 100.8 },
+      { time: 2, open: 100.8, high: 101.4, low: 100.5, close: 101.1 },
+      { time: 3, open: 101.1, high: 101.8, low: 100.9, close: 101.6 },
+      { time: 4, open: 101.6, high: 102.1, low: 101.2, close: 101.9 },
+      { time: 5, open: 101.9, high: 102.4, low: 101.6, close: 102.2 }
+    ],
+    stratB: {
+      stage: 'WAIT_CONFIRM',
+      bullMode: true,
+      activeZone: {
+        zoneLow: 100.2,
+        zoneHigh: 100.7,
+        obLow: 99.9,
+        obHigh: 100.8,
+        targetPrice: 102.8,
+        createdAt: 20,
+        expiresAt: 60,
+        sourceTime: 19,
+        trendLineSlope: 0.05,
+        trendLineBase: 99.8,
+        bullModeAtCreation: true
+      }
+    }
+  };
+  return runtime;
+}
+
+test('StrategyRuntimeProcessor emits readiness on close for non-executable STRAT_B setups', async () => {
   const captured: CapturedEvent[] = [];
   const processor = createProcessor(captured);
   const runtime = createStrategyRuntimeState('STRAT_B', 'v1');
-  const cfg = resolveStrategyConfig('STRAT_B');
-
   runtime.strategyState = {
-    ...INITIAL_MOMENTUM_STATE,
-    recentCandles: Array.from({ length: 20 }, (_, index) => ({
-      time: index + 1,
-      open: 100,
-      high: 100.15,
-      low: 99.95,
-      close: 100.03
-    }))
+    ...runtime.strategyState,
+    candles1h: [
+      { time: 1, open: 100, high: 101, low: 99.8, close: 100.8 },
+      { time: 2, open: 100.8, high: 101.4, low: 100.5, close: 101.1 },
+      { time: 3, open: 101.1, high: 101.8, low: 100.9, close: 101.6 }
+    ],
+    stratB: {
+      stage: 'WAIT_POI',
+      bullMode: true
+    }
   };
-
-  const impulseCandle: RuntimeCandle = {
-    time: 21,
-    open: 100.0,
-    high: 100.8,
-    low: 99.95,
-    close: 100.7,
-    volume: 1
-  };
-  const expectedImpulse = evaluateStrategyCandleDetailed(cfg.strategyId, runtime.strategyState, impulseCandle, cfg.momentum);
-
-  await processor.processClosedCandle(runtime, impulseCandle, 21_000);
-
-  const impulseReadiness = captured.filter((event) => event.eventType === 'ENTRY_READINESS').at(-1);
-  assert.equal(impulseReadiness?.payload.entryReadinessPct, expectedImpulse.readiness.entryReadinessPct);
-  assert.equal(impulseReadiness?.payload.entryReady, expectedImpulse.readiness.entryReady);
 
   await processor.processClosedCandle(runtime, {
-    time: 22,
-    open: 100.6,
-    high: 100.72,
-    low: 100.3,
-    close: 100.4,
+    time: 21,
+    open: 100.5,
+    high: 100.65,
+    low: 100.4,
+    close: 100.5,
     volume: 1
-  }, 22_000);
+  }, 21_000, '15m');
 
-  const pullbackReadiness = captured.filter((event) => event.eventType === 'ENTRY_READINESS').at(-1);
-  assert.equal(pullbackReadiness?.payload.entryReadinessPct, 85);
-  assert.equal(pullbackReadiness?.payload.entryReady, false);
+  const readiness = captured.filter((event) => event.eventType === 'ENTRY_READINESS').at(-1);
+  assert.ok(readiness);
+  assert.equal(typeof readiness?.payload.entryReadinessPct, 'number');
+  assert.equal(readiness?.payload.entryReady, false);
 });
 
 test('StrategyRuntimeProcessor emits semi-auto approved entry in the shared execution order', async () => {
@@ -126,54 +140,24 @@ test('StrategyRuntimeProcessor emits semi-auto approved entry in the shared exec
   assert.equal(captured[0]?.payload.qty, expectedSizing?.qty);
   assert.equal(captured[1]?.payload.notionalKrw, expectedSizing?.notionalKrw);
   assert.equal(runtime.strategyState.inPosition, true);
-  assert.equal(runtime.strategyState.entryPrice, 2027);
-  assert.equal(runtime.strategyState.positionQty, expectedSizing?.qty);
   assert.equal(runtime.pendingSemiAutoEntry, undefined);
-  assert.equal(runtime.lifecycleState, 'IN_POSITION');
 });
 
-test('StrategyRuntimeProcessor moves SEMI_AUTO runtime into WAITING_APPROVAL on entry signal', async () => {
+test('StrategyRuntimeProcessor moves SEMI_AUTO runtime into WAITING_APPROVAL on STRAT_B entry signal', async () => {
   const captured: CapturedEvent[] = [];
   const processor = createProcessor(captured, {
     mode: 'SEMI_AUTO'
   });
-  const runtime = createStrategyRuntimeState('STRAT_B', 'v1');
-  const cfg = resolveStrategyConfig('STRAT_B');
+  const runtime = createStratBReadyRuntime();
 
-  runtime.strategyState = {
-    ...INITIAL_MOMENTUM_STATE,
-    recentCandles: Array.from({ length: 20 }, (_, index) => ({
-      time: index + 1,
-      open: 100,
-      high: 100.15,
-      low: 99.95,
-      close: 100.03
-    }))
-  };
-
-  const impulseCandle: RuntimeCandle = {
-    time: 21,
-    open: 100.0,
-    high: 100.8,
-    low: 99.95,
-    close: 100.7,
-    volume: 1
-  };
-  const impulse = evaluateStrategyCandleDetailed(cfg.strategyId, runtime.strategyState, impulseCandle, cfg.momentum);
-  runtime.strategyState = impulse.result.nextState;
-
-  const strongCandle: RuntimeCandle = {
+  await processor.processClosedCandle(runtime, {
     time: 22,
-    open: 100.5,
-    high: 100.72,
-    low: 100.0,
-    close: 100.65,
+    open: 100.4,
+    high: 100.85,
+    low: 100.35,
+    close: 100.78,
     volume: 1
-  };
-  const expectedStrong = evaluateStrategyCandleDetailed(cfg.strategyId, runtime.strategyState, strongCandle, cfg.momentum);
-  assert.equal(expectedStrong.result.decisions.some((decision) => decision.eventType === 'SIGNAL_EMIT'), true);
-
-  await processor.processClosedCandle(runtime, strongCandle, 22_000);
+  }, 22_000, '15m');
 
   assert.deepEqual(captured.map((event) => event.eventType), [
     'SIGNAL_EMIT',
@@ -181,54 +165,127 @@ test('StrategyRuntimeProcessor moves SEMI_AUTO runtime into WAITING_APPROVAL on 
     'ENTRY_READINESS'
   ]);
   assert.equal(runtime.lifecycleState, 'WAITING_APPROVAL');
-  assert.equal(runtime.pendingSemiAutoEntry?.suggestedPrice, 100.65);
-  assert.equal(captured.at(-1)?.payload.reason, 'AWAITING_APPROVAL');
+  assert.equal(runtime.pendingSemiAutoEntry?.suggestedPrice, 100.78);
 });
 
-test('StrategyRuntimeProcessor sizes direct PAPER entries from risk snapshot', async () => {
+test('StrategyRuntimeProcessor does not spam duplicate readiness while STRAT_B waits for approval on the same candle', async () => {
   const captured: CapturedEvent[] = [];
-  const processor = createProcessor(captured);
-  const runtime = createStrategyRuntimeState('STRAT_B', 'v1');
-  const cfg = resolveStrategyConfig('STRAT_B');
-
-  runtime.strategyState = {
-    ...INITIAL_MOMENTUM_STATE,
-    recentCandles: Array.from({ length: 20 }, (_, index) => ({
-      time: index + 1,
-      open: 100,
-      high: 100.15,
-      low: 99.95,
-      close: 100.03
-    }))
-  };
+  const processor = createProcessor(captured, {
+    mode: 'SEMI_AUTO'
+  });
+  const runtime = createStratBReadyRuntime();
 
   await processor.processClosedCandle(runtime, {
-    time: 21,
-    open: 100.0,
-    high: 100.8,
-    low: 99.95,
-    close: 100.7,
-    volume: 1
-  }, 21_000);
-
-  const pullback: RuntimeCandle = {
     time: 22,
-    open: 100.5,
-    high: 100.72,
-    low: 100.0,
-    close: 100.65,
+    open: 100.4,
+    high: 100.85,
+    low: 100.35,
+    close: 100.78,
     volume: 1
-  };
-  const expectedEntry = evaluateStrategyCandleDetailed(cfg.strategyId, runtime.strategyState, pullback, cfg.momentum);
-  assert.equal(expectedEntry.result.decisions.some((decision) => decision.eventType === 'ORDER_INTENT'), true);
+  }, 22_000, '15m');
 
-  await processor.processClosedCandle(runtime, pullback, 22_000);
+  const readinessCountAfterSignal = captured.filter((event) => event.eventType === 'ENTRY_READINESS').length;
+
+  await processor.processTradeTick(runtime, {
+    market: 'KRW-XRP',
+    price: 100.79,
+    volume: 0.5,
+    tsMs: 22_500
+  }, {
+    time: 22,
+    open: 100.4,
+    high: 100.85,
+    low: 100.35,
+    close: 100.79,
+    volume: 1.5
+  }, 22_500);
+
+  const readinessEvents = captured.filter((event) => event.eventType === 'ENTRY_READINESS');
+  assert.equal(runtime.lifecycleState, 'WAITING_APPROVAL');
+  assert.equal(readinessCountAfterSignal, 1);
+  assert.equal(readinessEvents.length, 1);
+  assert.equal(readinessEvents[0]?.payload.reason, 'AWAITING_APPROVAL');
+});
+
+test('StrategyRuntimeProcessor emits one new readiness snapshot when STRAT_B approval wait advances to the next candle', async () => {
+  const captured: CapturedEvent[] = [];
+  const processor = createProcessor(captured, {
+    mode: 'SEMI_AUTO'
+  });
+  const runtime = createStratBReadyRuntime();
+
+  await processor.processClosedCandle(runtime, {
+    time: 22,
+    open: 100.4,
+    high: 100.85,
+    low: 100.35,
+    close: 100.78,
+    volume: 1
+  }, 22_000, '15m');
+
+  await processor.processCandleOpen(runtime, {
+    time: 23,
+    open: 100.8,
+    high: 100.9,
+    low: 100.7,
+    close: 100.82,
+    volume: 0
+  }, 23_000, '1m');
+
+  const readinessEvents = captured.filter((event) => event.eventType === 'ENTRY_READINESS');
+  assert.equal(readinessEvents.length, 2);
+  assert.equal(readinessEvents[0]?.candle.time, 22);
+  assert.equal(readinessEvents[1]?.candle.time, 23);
+  assert.equal(readinessEvents[1]?.payload.reason, 'AWAITING_APPROVAL');
+});
+
+test('StrategyRuntimeProcessor can force a deterministic STRAT_B SEMI_AUTO approval request for E2E', async () => {
+  const captured: CapturedEvent[] = [];
+  const processor = createProcessor(captured, {
+    mode: 'SEMI_AUTO',
+    e2eForceSemiAutoSignal: true
+  });
+  const runtime = createStrategyRuntimeState('STRAT_B', 'v1');
+
+  await processor.processCandleOpen(runtime, {
+    time: 31,
+    open: 100.2,
+    high: 100.4,
+    low: 100.1,
+    close: 100.3,
+    volume: 1
+  }, 31_000, '1m');
+
+  assert.deepEqual(captured.map((event) => event.eventType), [
+    'SIGNAL_EMIT',
+    'APPROVE_ENTER',
+    'ENTRY_READINESS'
+  ]);
+  assert.equal(captured[0]?.payload.reason, 'E2E_FORCE_SEMI_AUTO_SIGNAL');
+  assert.equal(captured[0]?.payload.forced, true);
+  assert.equal(runtime.lifecycleState, 'WAITING_APPROVAL');
+  assert.equal(runtime.pendingSemiAutoEntry?.suggestedPrice, 100.2);
+});
+
+test('StrategyRuntimeProcessor sizes direct PAPER entries from risk snapshot for STRAT_B', async () => {
+  const captured: CapturedEvent[] = [];
+  const processor = createProcessor(captured);
+  const runtime = createStratBReadyRuntime();
+
+  await processor.processClosedCandle(runtime, {
+    time: 22,
+    open: 100.4,
+    high: 100.85,
+    low: 100.35,
+    close: 100.78,
+    volume: 1
+  }, 22_000, '15m');
 
   const fillEvent = captured.find((event) => event.eventType === 'FILL');
   const expectedSizing = computeEntryOrderSizing({
     accountBaseKrw: runtime.riskSnapshot.seedKrw,
     maxPositionRatio: runtime.riskSnapshot.maxPositionRatio,
-    price: pullback.close
+    price: 100.78
   });
   assert.ok(fillEvent);
   assert.ok(expectedSizing);

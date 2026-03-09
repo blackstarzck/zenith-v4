@@ -20,7 +20,9 @@ test('updateOneMinuteCandle rolls the previous minute into a closed candle', () 
     high: 2016,
     low: 2014,
     close: 2016,
-    volume: 2
+    volume: 2,
+    tradeValue: 4029.6,
+    buyRatio: 0
   });
   assert.equal(rolled.current.time, 1772888940);
 });
@@ -43,6 +45,8 @@ test('snapshotToCandleState uses candle_date_time_utc as the bucket identity', (
     high: 2015,
     low: 2014,
     close: 2014,
-    volume: 3469.63378075
+    volume: 3469.63378075,
+    tradeValue: 0,
+    buyValue: 0
   });
 });

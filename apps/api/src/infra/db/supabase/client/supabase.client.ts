@@ -1,4 +1,4 @@
-import { SYSTEM_EVENT_TYPE, type WsEventEnvelopeDto } from '@zenith/contracts';
+import { SYSTEM_EVENT_TYPE, type DatasetRefDto, type RunReportDto, type WsEventEnvelopeDto } from '@zenith/contracts';
 import { Injectable } from '@nestjs/common';
 import { AxiosError } from 'axios';
 import { SupabaseRestClient } from '../../../../modules/supabase/supabase-rest.client';
@@ -8,6 +8,13 @@ import { RetryPolicyService } from '../../../../modules/resilience/policies/retr
 type SupabaseInsertResult = Readonly<{ ok: boolean; reason?: string }>;
 type StrategyId = 'STRAT_A' | 'STRAT_B' | 'STRAT_C';
 type RunMode = 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
+type EntryPolicySnapshot = Readonly<Record<string, unknown>>;
+type DatasetRefSnapshot = Readonly<Record<string, unknown>>;
+
+const RUN_SELECT = 'run_id,strategy_id,strategy_version,mode,market,fill_model_requested,fill_model_applied,entry_policy,dataset_ref,created_at,updated_at';
+const RUN_SELECT_NO_DATASET_REF = 'run_id,strategy_id,strategy_version,mode,market,fill_model_requested,fill_model_applied,entry_policy,created_at,updated_at';
+const RUN_SELECT_NO_ENTRY_POLICY = 'run_id,strategy_id,strategy_version,mode,market,fill_model_requested,fill_model_applied,dataset_ref,created_at,updated_at';
+const RUN_SELECT_LEGACY = 'run_id,strategy_id,strategy_version,mode,market,fill_model_requested,fill_model_applied,created_at,updated_at';
 
 export type PersistedRunRow = Readonly<{
   runId: string;
@@ -17,6 +24,8 @@ export type PersistedRunRow = Readonly<{
   market: string;
   fillModelRequested: string;
   fillModelApplied?: string;
+  entryPolicy?: string;
+  datasetRef?: DatasetRefDto;
   createdAt: string;
   updatedAt?: string;
 }>;
@@ -29,6 +38,9 @@ type RunShellInsert = Readonly<{
   market: string;
   timeframes: readonly string[];
   fill_model_requested: string;
+  fill_model_applied?: string;
+  entry_policy?: EntryPolicySnapshot;
+  dataset_ref?: DatasetRefSnapshot;
 }>;
 
 type RunShellUpdate = Readonly<{
@@ -38,6 +50,8 @@ type RunShellUpdate = Readonly<{
   market?: string;
   fill_model_requested?: string;
   fill_model_applied?: string;
+  entry_policy?: EntryPolicySnapshot;
+  dataset_ref?: DatasetRefSnapshot;
   updated_at?: string;
 }>;
 
@@ -57,6 +71,57 @@ type FillLedgerInsert = Readonly<{
   notional_krw: number;
   payload: Readonly<Record<string, unknown>>;
 }>;
+
+export type PersistedTradeInsert = Readonly<{
+  trade_id: string;
+  run_id: string;
+  entry_ts: string;
+  exit_ts: string;
+  entry_price: number;
+  exit_price: number;
+  qty: number;
+  notional_krw: number;
+  exit_reason: string;
+  gross_return_pct: number;
+  net_return_pct: number;
+  bars_delay: number;
+}>;
+
+export type PersistedRunReportSummary = Readonly<{
+  runId: string;
+  kpi: Readonly<{
+    count: number;
+    exits: number;
+    winCount: number;
+    lossCount: number;
+    winRate: number;
+    profitFactor: number;
+    avgWinPct: number;
+    avgLossPct: number;
+    sumReturnPct: number;
+    totalKrw: number;
+    mddPct: number;
+  }>;
+  exitReasonBreakdown: Readonly<Record<string, number>>;
+  artifactManifest: Readonly<Record<string, unknown>>;
+  createdAt: string;
+}>;
+
+type PersistedRunReportInsert = Readonly<{
+  run_id: string;
+  kpi: Readonly<Record<string, unknown>>;
+  exit_reason_breakdown: Readonly<Record<string, unknown>>;
+  artifact_manifest: Readonly<Record<string, unknown>>;
+  created_at: string;
+}>;
+
+type ArtifactUpload = Readonly<{
+  path: string;
+  contentType: string;
+  body: string;
+}>;
+
+const ARTIFACT_BUCKET = 'run-artifacts';
 
 @Injectable()
 export class SupabaseClientService {
@@ -157,8 +222,8 @@ export class SupabaseClientService {
 
   async listRuns(limit = 30): Promise<readonly PersistedRunRow[]> {
     const ctrl = new AbortController();
-    const rows = await this.rest.get<unknown[]>(
-      `text_runs?select=run_id,strategy_id,strategy_version,mode,market,fill_model_requested,fill_model_applied,created_at,updated_at&order=created_at.desc&limit=${Math.max(1, Math.min(limit, 100))}`,
+    const rows = await this.getRunShellRows(
+      `order=created_at.desc&limit=${Math.max(1, Math.min(limit, 100))}`,
       ctrl.signal
     );
     return rows
@@ -168,8 +233,8 @@ export class SupabaseClientService {
 
   async getRun(runId: string): Promise<PersistedRunRow | undefined> {
     const ctrl = new AbortController();
-    const rows = await this.rest.get<unknown[]>(
-      `text_runs?select=run_id,strategy_id,strategy_version,mode,market,fill_model_requested,fill_model_applied,created_at,updated_at&run_id=eq.${encodeURIComponent(runId)}&limit=1`,
+    const rows = await this.getRunShellRows(
+      `run_id=eq.${encodeURIComponent(runId)}&limit=1`,
       ctrl.signal
     );
     const first = Array.isArray(rows) ? rows[0] : undefined;
@@ -309,6 +374,122 @@ export class SupabaseClientService {
     return typeof seq === 'number' && Number.isFinite(seq) ? seq : 0;
   }
 
+  async listRunReportSummaries(runIds: readonly string[]): Promise<readonly PersistedRunReportSummary[]> {
+    if (runIds.length === 0) {
+      return [];
+    }
+
+    const chunks = chunkStrings(runIds, 100);
+    const out: PersistedRunReportSummary[] = [];
+
+    for (const chunk of chunks) {
+      const ctrl = new AbortController();
+      try {
+        const rows = await this.rest.get<unknown[]>(
+          `text_run_reports?select=run_id,kpi,exit_reason_breakdown,artifact_manifest,created_at&run_id=in.(${chunk.map((runId) => encodeSupabaseTextLiteral(runId)).join(',')})`,
+          ctrl.signal
+        );
+        out.push(
+          ...rows
+            .map(parsePersistedRunReportSummaryRow)
+            .filter((row): row is PersistedRunReportSummary => row !== undefined)
+        );
+      } catch (error: unknown) {
+        const parsed = parseSupabaseError(error);
+        if (isMissingRelationSupabaseError(error, 'text_run_reports')) {
+          this.logger.warn('Persisted run report summary query skipped because table is unavailable', {
+            source: 'infra.db.supabase.listRunReportSummaries',
+            eventType: SYSTEM_EVENT_TYPE.SUPABASE_WRITE_FAILED,
+            payload: {
+              status: parsed.status,
+              code: parsed.code,
+              hint: parsed.hint,
+              reason: parsed.message
+            }
+          });
+          return [];
+        }
+        throw error;
+      }
+    }
+
+    return out;
+  }
+
+  async syncRunArtifacts(
+    input: Readonly<{
+      runId: string;
+      trades: readonly PersistedTradeInsert[];
+      report: RunReportDto;
+      runReportJson: string;
+      tradesCsv: string;
+      eventsJsonl: string;
+    }>
+  ): Promise<void> {
+    const uploads = buildArtifactUploads(input);
+    try {
+      await this.retryPolicy.runWithRetry(
+        async (signal) => {
+          await this.rest.delete(`text_trades?run_id=eq.${encodeURIComponent(input.runId)}`, signal);
+          if (input.trades.length > 0) {
+            await this.rest.post('text_trades', input.trades, signal);
+          }
+          await this.patchRunShell(input.runId, {
+            dataset_ref: buildDatasetRefSnapshot(input.report.dataset.datasetRef),
+            updated_at: new Date().toISOString()
+          }, signal);
+          await this.rest.delete(`text_run_reports?run_id=eq.${encodeURIComponent(input.runId)}`, signal);
+          await this.rest.post('text_run_reports', buildRunReportInsert(input.report), signal);
+          await Promise.all(uploads.map((upload) => (
+            this.rest.uploadObject(
+              ARTIFACT_BUCKET,
+              toArtifactObjectPath(upload.path),
+              upload.body,
+              upload.contentType,
+              signal
+            )
+          )));
+        },
+        {
+          maxAttempts: 3,
+          baseDelayMs: 100,
+          timeoutMs: 4000,
+          source: 'infra.db.supabase.syncRunArtifacts',
+          timeoutEventType: SYSTEM_EVENT_TYPE.SUPABASE_TIMEOUT,
+          retryFailedEventType: SYSTEM_EVENT_TYPE.SUPABASE_WRITE_FAILED
+        }
+      );
+    } catch (error: unknown) {
+      const parsed = parseSupabaseError(error);
+      if (isMissingRelationSupabaseError(error, 'text_trades') || isMissingRelationSupabaseError(error, 'text_run_reports')) {
+        this.logger.warn('Run artifact persistence skipped because report/trade tables are unavailable', {
+          source: 'infra.db.supabase.syncRunArtifacts',
+          eventType: SYSTEM_EVENT_TYPE.SUPABASE_WRITE_FAILED,
+          runId: input.runId,
+          payload: {
+            status: parsed.status,
+            code: parsed.code,
+            hint: parsed.hint,
+            reason: parsed.message
+          }
+        });
+        return;
+      }
+
+      this.logger.warn('Run artifact persistence skipped after DB/storage error', {
+        source: 'infra.db.supabase.syncRunArtifacts',
+        eventType: SYSTEM_EVENT_TYPE.SUPABASE_WRITE_FAILED,
+        runId: input.runId,
+        payload: {
+          status: parsed.status,
+          code: parsed.code,
+          hint: parsed.hint,
+          reason: parsed.message
+        }
+      });
+    }
+  }
+
   async updateRunShell(
     runId: string,
     input: Readonly<{
@@ -318,29 +499,32 @@ export class SupabaseClientService {
       market?: string;
       fillModelRequested?: string;
       fillModelApplied?: string;
+      entryPolicy?: string;
+      datasetRef?: DatasetRefDto;
     }>
   ): Promise<void> {
-    const payload: RunShellUpdate = {
+    const payloadBase: Omit<RunShellUpdate, 'updated_at'> = {
       ...(input.strategyId ? { strategy_id: input.strategyId } : {}),
       ...(input.strategyVersion ? { strategy_version: input.strategyVersion } : {}),
       ...(input.mode ? { mode: input.mode } : {}),
       ...(input.market ? { market: input.market } : {}),
       ...(input.fillModelRequested ? { fill_model_requested: input.fillModelRequested } : {}),
       ...(input.fillModelApplied ? { fill_model_applied: input.fillModelApplied } : {}),
-      updated_at: new Date().toISOString()
+      ...(input.entryPolicy ? { entry_policy: buildEntryPolicySnapshot(input.entryPolicy) } : {}),
+      ...(input.datasetRef ? { dataset_ref: buildDatasetRefSnapshot(input.datasetRef) } : {})
     };
 
-    if (Object.keys(payload).length === 0) {
+    if (Object.keys(payloadBase).length === 0) {
       return;
     }
 
+    const payload: RunShellUpdate = {
+      ...payloadBase,
+      updated_at: new Date().toISOString()
+    };
     const ctrl = new AbortController();
     try {
-      await this.rest.patch(
-        `text_runs?run_id=eq.${encodeURIComponent(runId)}`,
-        payload,
-        ctrl.signal
-      );
+      await this.patchRunShell(runId, payload, ctrl.signal);
     } catch (error: unknown) {
       const parsed = parseSupabaseError(error);
       this.logger.warn('Run control persistence skipped', {
@@ -486,8 +670,9 @@ export class SupabaseClientService {
   }
 
   private async ensureRunExists(event: WsEventEnvelopeDto, signal: AbortSignal): Promise<void> {
+    const payload = buildRunShellInsert(event);
     try {
-      await this.rest.post('text_runs', buildRunShellInsert(event), signal);
+      await this.postRunShell(payload, signal);
     } catch (error: unknown) {
       const parsed = parseSupabaseError(error);
       const duplicate = isDuplicateSupabaseError(error);
@@ -511,6 +696,122 @@ export class SupabaseClientService {
         return;
       }
 
+      throw error;
+    }
+  }
+
+  private async getRunShellRows(
+    filterQuery: string,
+    signal: AbortSignal
+  ): Promise<unknown[]> {
+    try {
+      return await this.rest.get<unknown[]>(
+        `text_runs?select=${RUN_SELECT}&${filterQuery}`,
+        signal
+      );
+    } catch (error: unknown) {
+      if (isMissingColumnSupabaseError(error, 'entry_policy')) {
+        try {
+          return await this.rest.get<unknown[]>(
+            `text_runs?select=${RUN_SELECT_NO_ENTRY_POLICY}&${filterQuery}`,
+            signal
+          );
+        } catch (legacyError: unknown) {
+          if (!isMissingColumnSupabaseError(legacyError, 'dataset_ref')) {
+            throw legacyError;
+          }
+        }
+      } else if (isMissingColumnSupabaseError(error, 'dataset_ref')) {
+        try {
+          return await this.rest.get<unknown[]>(
+            `text_runs?select=${RUN_SELECT_NO_DATASET_REF}&${filterQuery}`,
+            signal
+          );
+        } catch (legacyError: unknown) {
+          if (!isMissingColumnSupabaseError(legacyError, 'entry_policy')) {
+            throw legacyError;
+          }
+        }
+      } else {
+        throw error;
+      }
+    }
+
+    return this.rest.get<unknown[]>(
+      `text_runs?select=${RUN_SELECT_LEGACY}&${filterQuery}`,
+      signal
+    );
+  }
+
+  private async postRunShell(payload: RunShellInsert, signal: AbortSignal): Promise<void> {
+    try {
+      await this.rest.post('text_runs', payload, signal);
+      return;
+    } catch (error: unknown) {
+      if (payload.entry_policy && isMissingColumnSupabaseError(error, 'entry_policy')) {
+        try {
+          await this.rest.post('text_runs', omitEntryPolicyInsert(payload), signal);
+          return;
+        } catch (legacyError: unknown) {
+          if (!(payload.dataset_ref && isMissingColumnSupabaseError(legacyError, 'dataset_ref'))) {
+            throw legacyError;
+          }
+          await this.rest.post('text_runs', omitDatasetRefInsert(omitEntryPolicyInsert(payload)), signal);
+          return;
+        }
+      }
+
+      if (payload.dataset_ref && isMissingColumnSupabaseError(error, 'dataset_ref')) {
+        try {
+          await this.rest.post('text_runs', omitDatasetRefInsert(payload), signal);
+          return;
+        } catch (legacyError: unknown) {
+          if (!(payload.entry_policy && isMissingColumnSupabaseError(legacyError, 'entry_policy'))) {
+            throw legacyError;
+          }
+          await this.rest.post('text_runs', omitEntryPolicyInsert(omitDatasetRefInsert(payload)), signal);
+          return;
+        }
+      }
+      throw error;
+    }
+  }
+
+  private async patchRunShell(
+    runId: string,
+    payload: RunShellUpdate,
+    signal: AbortSignal
+  ): Promise<void> {
+    const path = `text_runs?run_id=eq.${encodeURIComponent(runId)}`;
+    try {
+      await this.rest.patch(path, payload, signal);
+      return;
+    } catch (error: unknown) {
+      if (payload.entry_policy && isMissingColumnSupabaseError(error, 'entry_policy')) {
+        try {
+          await this.rest.patch(path, omitEntryPolicyUpdate(payload), signal);
+          return;
+        } catch (legacyError: unknown) {
+          if (!(payload.dataset_ref && isMissingColumnSupabaseError(legacyError, 'dataset_ref'))) {
+            throw legacyError;
+          }
+          await this.rest.patch(path, omitDatasetRefUpdate(omitEntryPolicyUpdate(payload)), signal);
+          return;
+        }
+      }
+
+      if (payload.dataset_ref && isMissingColumnSupabaseError(error, 'dataset_ref')) {
+        try {
+          await this.rest.patch(path, omitDatasetRefUpdate(payload), signal);
+          return;
+        } catch (legacyError: unknown) {
+          if (!(payload.entry_policy && isMissingColumnSupabaseError(legacyError, 'entry_policy'))) {
+            throw legacyError;
+          }
+          await this.rest.patch(path, omitEntryPolicyUpdate(omitDatasetRefUpdate(payload)), signal);
+          return;
+        }
+      }
       throw error;
     }
   }
@@ -544,6 +845,8 @@ function parseSupabaseError(error: unknown): ParsedSupabaseError {
 
 function buildRunShellInsert(event: WsEventEnvelopeDto): RunShellInsert {
   const payload = toRecord(event.payload);
+  const entryPolicy = buildEntryPolicySnapshotFromValue(payload.entryPolicy ?? payload.entry_policy);
+  const datasetRef = buildDatasetRefSnapshotFromValue(payload.datasetRef ?? payload.dataset_ref);
 
   return {
     run_id: event.runId,
@@ -554,8 +857,60 @@ function buildRunShellInsert(event: WsEventEnvelopeDto): RunShellInsert {
     timeframes: readStringArray(payload, ['timeframes', 'timeFrames']) ?? [],
     fill_model_requested:
       readString(payload, ['fillModelRequested', 'fill_model_requested']) ??
-      'AUTO'
+      'AUTO',
+    ...(readString(payload, ['fillModelApplied', 'fill_model_applied'])
+      ? { fill_model_applied: readString(payload, ['fillModelApplied', 'fill_model_applied']) as string }
+      : {}),
+    ...(entryPolicy ? { entry_policy: entryPolicy } : {}),
+    ...(datasetRef ? { dataset_ref: datasetRef } : {})
   };
+}
+
+function buildRunReportInsert(report: RunReportDto): PersistedRunReportInsert {
+  return {
+    run_id: report.runId,
+    kpi: {
+      ...report.results.trades,
+      totalKrw: report.results.pnl.totalKrw,
+      mddPct: report.results.pnl.mddPct
+    },
+    exit_reason_breakdown: report.results.exitReasonBreakdown,
+    artifact_manifest: report.artifacts,
+    created_at: report.createdAt
+  };
+}
+
+function buildArtifactUploads(input: Readonly<{
+  report: RunReportDto;
+  runReportJson: string;
+  tradesCsv: string;
+  eventsJsonl: string;
+}>): readonly ArtifactUpload[] {
+  return [
+    {
+      path: input.report.artifacts.runReportJson,
+      contentType: 'application/json; charset=utf-8',
+      body: input.runReportJson
+    },
+    {
+      path: input.report.artifacts.tradesCsv,
+      contentType: 'text/csv; charset=utf-8',
+      body: input.tradesCsv
+    },
+    {
+      path: input.report.artifacts.eventsJsonl,
+      contentType: 'application/x-ndjson; charset=utf-8',
+      body: input.eventsJsonl
+    }
+  ];
+}
+
+function toArtifactObjectPath(path: string): string {
+  const normalized = path.replace(/^\/+/, '');
+  if (normalized.startsWith(`${ARTIFACT_BUCKET}/`)) {
+    return normalized.slice(ARTIFACT_BUCKET.length + 1);
+  }
+  return normalized;
 }
 
 function toRecord(value: unknown): Readonly<Record<string, unknown>> {
@@ -569,6 +924,16 @@ function readString(payload: Readonly<Record<string, unknown>>, keys: readonly s
   for (const key of keys) {
     const value = payload[key];
     if (typeof value === 'string' && value.trim().length > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function readNumber(payload: Readonly<Record<string, unknown>>, keys: readonly string[]): number | undefined {
+  for (const key of keys) {
+    const value = payload[key];
+    if (typeof value === 'number' && Number.isFinite(value)) {
       return value;
     }
   }
@@ -617,6 +982,8 @@ function parsePersistedRunRow(value: unknown): PersistedRunRow | undefined {
   const fillModelRequested = row.fill_model_requested;
   const createdAt = row.created_at;
   const fillModelApplied = row.fill_model_applied;
+  const entryPolicy = parsePersistedEntryPolicy(row.entry_policy);
+  const datasetRef = parsePersistedDatasetRef(row.dataset_ref);
   const updatedAt = row.updated_at;
 
   if (
@@ -639,9 +1006,184 @@ function parsePersistedRunRow(value: unknown): PersistedRunRow | undefined {
     market,
     fillModelRequested,
     ...(typeof fillModelApplied === 'string' ? { fillModelApplied } : {}),
+    ...(typeof entryPolicy === 'string' ? { entryPolicy } : {}),
+    ...(datasetRef ? { datasetRef } : {}),
     createdAt,
     ...(typeof updatedAt === 'string' ? { updatedAt } : {})
   };
+}
+
+function parsePersistedRunReportSummaryRow(value: unknown): PersistedRunReportSummary | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const row = value as Record<string, unknown>;
+  const runId = row.run_id;
+  const createdAt = row.created_at;
+  const kpi = toRecord(row.kpi);
+
+  if (typeof runId !== 'string' || typeof createdAt !== 'string') {
+    return undefined;
+  }
+
+  return {
+    runId,
+    kpi: {
+      count: readNumber(kpi, ['count']) ?? 0,
+      exits: readNumber(kpi, ['exits']) ?? 0,
+      winCount: readNumber(kpi, ['winCount']) ?? 0,
+      lossCount: readNumber(kpi, ['lossCount']) ?? 0,
+      winRate: readNumber(kpi, ['winRate']) ?? 0,
+      profitFactor: readNumber(kpi, ['profitFactor']) ?? 0,
+      avgWinPct: readNumber(kpi, ['avgWinPct']) ?? 0,
+      avgLossPct: readNumber(kpi, ['avgLossPct']) ?? 0,
+      sumReturnPct: readNumber(kpi, ['sumReturnPct']) ?? 0,
+      totalKrw: readNumber(kpi, ['totalKrw']) ?? 0,
+      mddPct: readNumber(kpi, ['mddPct']) ?? 0
+    },
+    exitReasonBreakdown: readNumberRecord(row.exit_reason_breakdown),
+    artifactManifest: toRecord(row.artifact_manifest),
+    createdAt
+  };
+}
+
+function buildEntryPolicySnapshot(value: string): EntryPolicySnapshot {
+  return { key: value };
+}
+
+function buildDatasetRefSnapshot(value: DatasetRefDto): DatasetRefSnapshot {
+  return {
+    key: value.key,
+    source: value.source,
+    profile: value.profile,
+    market: value.market,
+    timeframes: value.timeframes,
+    feeds: value.feeds,
+    dateRangeLabel: value.dateRangeLabel,
+    ...(value.windowStart ? { windowStart: value.windowStart } : {}),
+    ...(value.windowEnd ? { windowEnd: value.windowEnd } : {}),
+    exact: value.exact
+  };
+}
+
+function buildEntryPolicySnapshotFromValue(value: unknown): EntryPolicySnapshot | undefined {
+  if (typeof value === 'string' && value.trim().length > 0) {
+    return buildEntryPolicySnapshot(value);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const snapshot = value as Record<string, unknown>;
+  const key = readString(snapshot, ['key', 'value', 'entryPolicy', 'entry_policy']);
+  if (key) {
+    return { ...snapshot, key };
+  }
+  return Object.keys(snapshot).length > 0 ? snapshot : undefined;
+}
+
+function buildDatasetRefSnapshotFromValue(value: unknown): DatasetRefSnapshot | undefined {
+  const parsed = parsePersistedDatasetRef(value);
+  return parsed ? buildDatasetRefSnapshot(parsed) : undefined;
+}
+
+function parsePersistedEntryPolicy(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.trim().length > 0) {
+    return value;
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  return readString(value as Record<string, unknown>, ['key', 'value', 'entryPolicy', 'entry_policy']);
+}
+
+function parsePersistedDatasetRef(value: unknown): DatasetRefDto | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const snapshot = value as Record<string, unknown>;
+  const key = readString(snapshot, ['key']);
+  const source = readString(snapshot, ['source']);
+  const profile = readString(snapshot, ['profile']);
+  const market = readString(snapshot, ['market']);
+  const timeframes = readStringArray(snapshot, ['timeframes', 'timeFrames']);
+  const feeds = readStringArray(snapshot, ['feeds']);
+  const dateRangeLabel = readString(snapshot, ['dateRangeLabel', 'date_range_label']);
+  const exact = snapshot.exact;
+  const windowStart = readString(snapshot, ['windowStart', 'window_start']);
+  const windowEnd = readString(snapshot, ['windowEnd', 'window_end']);
+
+  if (
+    !key ||
+    (source !== 'UPBIT' && source !== 'CSV_REPLAY' && source !== 'JSONL_REPLAY' && source !== 'MANUAL') ||
+    (profile !== 'REALTIME_RUNTIME' && profile !== 'REPLAY_BACKTEST' && profile !== 'DOC_BENCHMARK') ||
+    !market ||
+    !timeframes ||
+    !feeds ||
+    !dateRangeLabel ||
+    typeof exact !== 'boolean'
+  ) {
+    return undefined;
+  }
+
+  return {
+    key,
+    source,
+    profile,
+    market,
+    timeframes,
+    feeds,
+    dateRangeLabel,
+    ...(windowStart ? { windowStart } : {}),
+    ...(windowEnd ? { windowEnd } : {}),
+    exact
+  };
+}
+
+function readNumberRecord(value: unknown): Readonly<Record<string, number>> {
+  const record = toRecord(value);
+  return Object.entries(record).reduce<Record<string, number>>((acc, [key, raw]) => {
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      acc[key] = raw;
+    }
+    return acc;
+  }, {});
+}
+
+function chunkStrings(values: readonly string[], size: number): string[][] {
+  const normalizedSize = Math.max(1, size);
+  const out: string[][] = [];
+  for (let index = 0; index < values.length; index += normalizedSize) {
+    out.push(values.slice(index, index + normalizedSize));
+  }
+  return out;
+}
+
+function encodeSupabaseTextLiteral(value: string): string {
+  return `"${encodeURIComponent(value).replace(/"/g, '%22')}"`;
+}
+
+function omitEntryPolicyInsert(payload: RunShellInsert): RunShellInsert {
+  const { entry_policy: _entryPolicy, ...legacyPayload } = payload;
+  return legacyPayload;
+}
+
+function omitEntryPolicyUpdate(payload: RunShellUpdate): RunShellUpdate {
+  const { entry_policy: _entryPolicy, ...legacyPayload } = payload;
+  return legacyPayload;
+}
+
+function omitDatasetRefInsert(payload: RunShellInsert): RunShellInsert {
+  const { dataset_ref: _datasetRef, ...legacyPayload } = payload;
+  return legacyPayload;
+}
+
+function omitDatasetRefUpdate(payload: RunShellUpdate): RunShellUpdate {
+  const { dataset_ref: _datasetRef, ...legacyPayload } = payload;
+  return legacyPayload;
 }
 
 function parsePersistedEventRow(value: unknown): WsEventEnvelopeDto | undefined {
@@ -800,6 +1342,31 @@ function roundMoney(value: number): number {
 }
 
 function isMissingFillLedgerError(error: unknown): boolean {
+  return isMissingRelationSupabaseError(error, 'text_fills');
+}
+
+function isMissingColumnSupabaseError(error: unknown, columnName: string): boolean {
   const parsed = parseSupabaseError(error);
-  return parsed.status === 404 && parsed.message.toLowerCase().includes('text_fills');
+  const normalizedColumn = columnName.toLowerCase();
+  const normalizedMessage = parsed.message.toLowerCase();
+  const normalizedHint = parsed.hint?.toLowerCase() ?? '';
+  return (
+    parsed.status === 400 &&
+    (parsed.code === 'PGRST204' || parsed.code === '42703' || normalizedMessage.includes('column')) &&
+    (normalizedMessage.includes(normalizedColumn) || normalizedHint.includes(normalizedColumn))
+  );
+}
+
+function isMissingRelationSupabaseError(error: unknown, relationName: string): boolean {
+  const parsed = parseSupabaseError(error);
+  const normalizedRelation = relationName.toLowerCase();
+  const normalizedMessage = parsed.message.toLowerCase();
+  const normalizedHint = parsed.hint?.toLowerCase() ?? '';
+  return (
+    (parsed.status === 404 || parsed.status === 400) &&
+    (normalizedMessage.includes(`public.${normalizedRelation}`) ||
+      normalizedMessage.includes(`'${normalizedRelation}'`) ||
+      normalizedMessage.includes(`relation "${normalizedRelation}"`) ||
+      normalizedHint.includes(normalizedRelation))
+  );
 }

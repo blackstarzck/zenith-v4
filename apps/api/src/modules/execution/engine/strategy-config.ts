@@ -18,7 +18,11 @@ const STRATEGY_CONFIGS: Readonly<Record<StrategyId, StrategyRuntimeConfig>> = {
       takeProfitPct: DEFAULT_PARAMETER_VALUES.a.tpPct,
       stopLossPct: 0.25,
       maxHoldBars: DEFAULT_PARAMETER_VALUES.a.timeExitMaxHoldBars,
+      feePerSide: DEFAULT_PARAMETER_VALUES.common.feePerSide,
+      slippageRate: DEFAULT_PARAMETER_VALUES.common.slippageAssumedPct,
       stratA: {
+        entryAfterConfirmFill: DEFAULT_PARAMETER_VALUES.a.entryAfterConfirmFill,
+        partialExitFillTiming: DEFAULT_PARAMETER_VALUES.a.partialExitFillTiming,
         bbPeriod: DEFAULT_PARAMETER_VALUES.a.bbPeriod,
         bbStd: DEFAULT_PARAMETER_VALUES.a.bbStd,
         atrPeriod: DEFAULT_PARAMETER_VALUES.a.atrPeriod,
@@ -46,14 +50,25 @@ const STRATEGY_CONFIGS: Readonly<Record<StrategyId, StrategyRuntimeConfig>> = {
       takeProfitPct: 0.25,
       stopLossPct: 0.2,
       maxHoldBars: DEFAULT_PARAMETER_VALUES.b.timeExitBars,
+      feePerSide: DEFAULT_PARAMETER_VALUES.common.feePerSide,
+      slippageRate: DEFAULT_PARAMETER_VALUES.common.slippageAssumedPct,
       stratB: {
+        requireUserConfirm: DEFAULT_PARAMETER_VALUES.b.requireUserConfirm,
+        approvalDelayBars: DEFAULT_PARAMETER_VALUES.b.approvalDelayBars,
+        fillWhenAuto: DEFAULT_PARAMETER_VALUES.b.entryFillWhenAuto,
+        fillWhenSemiAuto: DEFAULT_PARAMETER_VALUES.b.entryFillWhenSemiAuto,
         atrPeriod: DEFAULT_PARAMETER_VALUES.b.atrPeriod,
         impulseMult: DEFAULT_PARAMETER_VALUES.b.impulseMult,
         impulseBodyRatioMin: DEFAULT_PARAMETER_VALUES.b.impulseBodyRatioMin,
         poiValidBars: DEFAULT_PARAMETER_VALUES.b.poiValidBars,
         obLookback: DEFAULT_PARAMETER_VALUES.b.obLookback,
         slBuffer: DEFAULT_PARAMETER_VALUES.b.slBuffer,
-        tpRrFallback: DEFAULT_PARAMETER_VALUES.b.tpRrFallback
+        tpRrFallback: DEFAULT_PARAMETER_VALUES.b.tpRrFallback,
+        trendlineLookback: DEFAULT_PARAMETER_VALUES.b.trendlineLookback,
+        bullModeLookback: DEFAULT_PARAMETER_VALUES.b.bullModeLookback,
+        bullModeMinClosesAboveTrend: DEFAULT_PARAMETER_VALUES.b.bullModeMinClosesAboveTrend,
+        fvgMinGapPct: DEFAULT_PARAMETER_VALUES.b.fvgMinGapPct,
+        timeExitBars: DEFAULT_PARAMETER_VALUES.b.timeExitBars
       }
     }
   },
@@ -65,6 +80,9 @@ const STRATEGY_CONFIGS: Readonly<Record<StrategyId, StrategyRuntimeConfig>> = {
       takeProfitPct: DEFAULT_PARAMETER_VALUES.c.tp2Pct,
       stopLossPct: DEFAULT_PARAMETER_VALUES.c.slPct,
       maxHoldBars: DEFAULT_PARAMETER_VALUES.c.timeStopMinutes,
+      orderKrw: DEFAULT_PARAMETER_VALUES.c.fixedOrderKrw,
+      feePerSide: DEFAULT_PARAMETER_VALUES.common.feePerSide,
+      slippageRate: DEFAULT_PARAMETER_VALUES.common.slippageAssumedPct,
       stratC: {
         allowedHoursKst: DEFAULT_PARAMETER_VALUES.c.entryAllowedHoursKst,
         breakoutLookbackCandles: DEFAULT_PARAMETER_VALUES.c.breakoutLookbackCandles,
@@ -72,10 +90,17 @@ const STRATEGY_CONFIGS: Readonly<Record<StrategyId, StrategyRuntimeConfig>> = {
         valueSpikeMult: DEFAULT_PARAMETER_VALUES.c.valueSpikeMult,
         buyRatioMin: DEFAULT_PARAMETER_VALUES.c.buyRatioMin,
         bodyRatioMin: DEFAULT_PARAMETER_VALUES.c.bodyRatioMin,
+        fixedOrderKrw: DEFAULT_PARAMETER_VALUES.c.fixedOrderKrw,
         tp1Pct: DEFAULT_PARAMETER_VALUES.c.tp1Pct,
+        tp1Ratio: DEFAULT_PARAMETER_VALUES.c.tp1Ratio,
         tp2Pct: DEFAULT_PARAMETER_VALUES.c.tp2Pct,
+        tp2Ratio: DEFAULT_PARAMETER_VALUES.c.tp2Ratio,
         slPct: DEFAULT_PARAMETER_VALUES.c.slPct,
-        timeStopMinutes: DEFAULT_PARAMETER_VALUES.c.timeStopMinutes
+        timeStopMinutes: DEFAULT_PARAMETER_VALUES.c.timeStopMinutes,
+        cooldownMinutes: DEFAULT_PARAMETER_VALUES.c.cooldownMinutes,
+        cooldownAfterStopMinutes: DEFAULT_PARAMETER_VALUES.c.cooldownAfterStopMinutes,
+        pauseAfterConsecutiveStops: DEFAULT_PARAMETER_VALUES.c.pauseAfterConsecutiveStops,
+        pauseMinutes: DEFAULT_PARAMETER_VALUES.c.pauseMinutes
       }
     }
   }

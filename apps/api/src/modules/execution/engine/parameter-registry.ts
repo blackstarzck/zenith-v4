@@ -4,6 +4,10 @@ export const PARAMETER_KEYS = Object.freeze({
     fillModel: 'common.fillModel',
     seedKrw: 'common.seedKrw',
     market: 'common.market',
+    slippageAssumedPct: 'common.slippage.assumedPct',
+    feeMode: 'common.fee.mode',
+    feePerSide: 'common.fee.perSide',
+    feeRoundtrip: 'common.fee.roundtrip',
     riskMaxPositionRatio: 'common.risk.maxPositionRatio',
     riskDailyLossLimitPct: 'common.risk.dailyLossLimitPct',
     riskMaxConsecutiveLosses: 'common.risk.maxConsecutiveLosses',
@@ -42,7 +46,11 @@ export const PARAMETER_KEYS = Object.freeze({
     obLookback: 'b.ob.lookback',
     slBuffer: 'b.sl.buffer',
     tpRrFallback: 'b.tp.rrFallback',
-    timeExitBars: 'b.timeExit.bars'
+    timeExitBars: 'b.timeExit.bars',
+    trendlineLookback: 'b.trendline.lookback',
+    bullModeLookback: 'b.bullMode.lookback',
+    bullModeMinClosesAboveTrend: 'b.bullMode.minClosesAboveTrend',
+    fvgMinGapPct: 'b.fvg.minGapPct'
   },
   c: {
     entryAllowedHoursKst: 'c.entry.allowedHoursKst',
@@ -51,17 +59,26 @@ export const PARAMETER_KEYS = Object.freeze({
     valueSpikeMult: 'c.valueSpike.mult',
     buyRatioMin: 'c.buyRatio.min',
     bodyRatioMin: 'c.bodyRatio.min',
+    fixedOrderKrw: 'c.order.fixedKrw',
     tp1Pct: 'c.tp1.pct',
     tp1Ratio: 'c.tp1.ratio',
     tp2Pct: 'c.tp2.pct',
     tp2Ratio: 'c.tp2.ratio',
     slPct: 'c.sl.pct',
-    timeStopMinutes: 'c.timeStop.minutes'
+    timeStopMinutes: 'c.timeStop.minutes',
+    cooldownMinutes: 'c.cooldown.normalMinutes',
+    cooldownAfterStopMinutes: 'c.cooldown.afterStopMinutes',
+    pauseAfterConsecutiveStops: 'c.pause.consecutiveStops',
+    pauseMinutes: 'c.pause.minutes'
   }
 });
 
 export const DEFAULT_PARAMETER_VALUES = Object.freeze({
   common: {
+    slippageAssumedPct: 0.0,
+    feeMode: 'PER_SIDE',
+    feePerSide: 0.0005,
+    feeRoundtrip: 0.001,
     seedKrw: 1_000_000,
     riskMaxPositionRatio: 0.2,
     riskDailyLossLimitPct: -2,
@@ -70,6 +87,8 @@ export const DEFAULT_PARAMETER_VALUES = Object.freeze({
     riskKillSwitch: true
   },
   a: {
+    entryAfterConfirmFill: 'NEXT_OPEN' as const,
+    partialExitFillTiming: 'NEXT_OPEN' as const,
     bbPeriod: 20,
     bbStd: 2.0,
     atrPeriod: 14,
@@ -79,7 +98,7 @@ export const DEFAULT_PARAMETER_VALUES = Object.freeze({
     filtersExcludeEntryHoursKst: [13] as const,
     filtersMaxAdx: 35,
     filtersRsiSlopeMin: 1.0,
-    tpPct: 0.6,
+    tpPct: 0.006,
     partialRatio: 0.5,
     trailAtrMult: 1.2,
     timeExitMaxHoldBars: 10,
@@ -90,6 +109,8 @@ export const DEFAULT_PARAMETER_VALUES = Object.freeze({
   b: {
     requireUserConfirm: true,
     approvalDelayBars: 1,
+    entryFillWhenAuto: 'ON_CLOSE' as const,
+    entryFillWhenSemiAuto: 'NEXT_OPEN' as const,
     atrPeriod: 14,
     impulseMult: 1.5,
     impulseBodyRatioMin: 0.5,
@@ -97,7 +118,11 @@ export const DEFAULT_PARAMETER_VALUES = Object.freeze({
     obLookback: 10,
     slBuffer: 0.002,
     tpRrFallback: 1.5,
-    timeExitBars: 24
+    timeExitBars: 24,
+    trendlineLookback: 6,
+    bullModeLookback: 5,
+    bullModeMinClosesAboveTrend: 3,
+    fvgMinGapPct: 0.001
   },
   c: {
     entryAllowedHoursKst: [6, 7, 10, 14, 16, 20, 22] as const,
@@ -106,11 +131,16 @@ export const DEFAULT_PARAMETER_VALUES = Object.freeze({
     valueSpikeMult: 4.0,
     buyRatioMin: 0.75,
     bodyRatioMin: 0.7,
-    tp1Pct: 0.4,
+    fixedOrderKrw: 50_000,
+    tp1Pct: 0.004,
     tp1Ratio: 0.7,
-    tp2Pct: 0.6,
+    tp2Pct: 0.006,
     tp2Ratio: 0.3,
-    slPct: 0.4,
-    timeStopMinutes: 5
+    slPct: 0.004,
+    timeStopMinutes: 5,
+    cooldownMinutes: 2,
+    cooldownAfterStopMinutes: 5,
+    pauseAfterConsecutiveStops: 2,
+    pauseMinutes: 20
   }
 });

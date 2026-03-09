@@ -65,7 +65,7 @@ create table if not exists text_runs (
   ended_at timestamptz,
   fill_model_requested text not null, -- AUTO 또는 명시 모델
   fill_model_applied fill_model,
-  entry_policy jsonb not null default '{}'::jsonb,
+  entry_policy jsonb not null default '{}'::jsonb, -- 최소 { "key": "<canonical entryPolicy>" }
   dataset_ref jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -76,6 +76,8 @@ create index if not exists idx_runs_strategy_time
 create index if not exists idx_runs_status
   on text_runs (status);
 ```
+
+- 앱은 `entry_policy`를 우선 조회/갱신하되, 구버전 배포 환경에서 컬럼이 아직 없을 수 있으므로 legacy select/update fallback을 유지한다.
 
 ### 3.2 `text_run_configs`
 ```sql
@@ -292,3 +294,11 @@ create index if not exists idx_fills_side_ts
 
 - Backfill for existing environments should insert valid legacy `FILL` rows from `text_run_events` into `text_fills` with `on conflict (run_id, seq) do nothing`.
 - Deploy order: schema first, backfill second, app read-path switch last.
+
+# Run artifact storage upload addendum (ASCII appendix)
+- Runtime artifact upload path now targets the existing private Storage bucket:
+  - `run-artifacts/<runId>/run_report.json`
+  - `run-artifacts/<runId>/trades.csv`
+  - `run-artifacts/<runId>/events.jsonl`
+- The DB schema does not need a new table for this step because `text_run_reports.artifact_manifest` already stores the logical artifact paths.
+- Remaining DB-side work is still `dataset_ref` persistence in `text_runs`.

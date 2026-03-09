@@ -1,28 +1,12 @@
 import { useEffect, useState } from 'react';
 import { Card, Table, Typography } from 'antd';
 import { Link } from 'react-router-dom';
+import type { RunHistoryItemDto } from '@zenith/contracts';
 import { httpGet } from '../../../shared/api/http';
 
 const { Title } = Typography;
 
-type RunHistoryRow = Readonly<{
-  runId: string;
-  strategyId: 'STRAT_A' | 'STRAT_B' | 'STRAT_C';
-  strategyVersion: string;
-  mode: 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
-  fillModelApplied: 'NEXT_OPEN' | 'ON_CLOSE';
-  entryPolicy: string;
-  eventCount: number;
-  trades: number;
-  exits: number;
-  winRate: number;
-  sumReturnPct: number;
-  mddPct: number;
-  profitFactor: number;
-  avgWinPct: number;
-  avgLossPct: number;
-  lastEventAt?: string;
-}>;
+type RunHistoryRow = RunHistoryItemDto;
 
 export function ReportsRunsPage() {
   const [rows, setRows] = useState<RunHistoryRow[]>([]);

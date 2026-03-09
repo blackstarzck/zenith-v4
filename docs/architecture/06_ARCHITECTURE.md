@@ -3,7 +3,7 @@
 
 ## A. 아키텍처 개요
 ### A1) 핵심 원칙
-- 3개 전략은 엔진 관점에서 동일 실행 파이프라인을 공유한다.
+- 3개 전략은 하나의 시장 데이터 피드를 공유하되, 전략별 `runId`, `strategyState`, `riskState`는 분리한다.
 - 전략마다 달라지는 것은 “시그널/파라미터/포지션 정책” 뿐이다.
 - 문서 통합/리팩터링 과정에서 로직 훼손을 막기 위해 **엔진 계약(Contract)** 을 단일 진실로 둔다.
 
@@ -95,6 +95,7 @@ confirm이 `close[t+1] > open[t+1]`처럼 “t+1 close 확정”을 요구한다
 - RUN_START / RUN_END
 - CANDLE_OPEN / CANDLE_CLOSE
 - SIGNAL_EMIT
+- ENTRY_READINESS
 - APPROVE_ENTER (SEMI_AUTO)
 - ORDER_INTENT
 - FILL
@@ -253,11 +254,14 @@ sequenceDiagram
   - bucket rollover -> closed candle
   - snapshot candle -> minute bucket identity
 - `apps/api/src/modules/execution/engine/strategy-runtime-processor.ts` is the SSOT for closed-candle strategy runtime transitions:
-  - closed candle evaluation
+  - candle open/close evaluation
+  - trade/ticker/orderbook runtime fan-in
   - semi-auto approval wait/execute path
   - risk block and pause emission
   - readiness event emission
 - `apps/api/src/modules/execution/engine/strategy-runtime-state.ts` owns per-strategy runtime boot state such as `runId`, momentum state, risk state, and pending semi-auto entry.
+- `apps/api/src/modules/execution/engine/strategies/<strategyId>/strategy.ts` is the only place where strategy-specific entry/exit logic may live.
+- `apps/api/src/modules/execution/engine/shared/` owns reusable indicators, event types, timeframe aggregation, and strategy module contracts.
 - Any future realtime change must preserve this direction:
   - websocket/data ingest -> candle state helper
   - closed candle -> runtime processor
@@ -280,13 +284,13 @@ sequenceDiagram
 - This helper owns:
   - websocket construction
   - open/message/error/close listener binding
-  - trade-stream subscription payload
+  - `trade/ticker/orderbook` subscription payload
   - reconnect backoff scheduling
   - health-check timer logging
   - reconnect recovery metric updates
 - `apps/api/src/modules/execution/engine/upbit-realtime-engine.ts` must treat this helper as the only owner of websocket connection state and timers.
 - Required recovery behavior:
-  - open -> subscribe trade stream
+  - open -> subscribe `trade`, `ticker`, `orderbook`
   - close without owner stop -> schedule reconnect
   - reconnect success -> mark recovery metric
   - owner stop/destroy -> clear timers and suppress reconnect scheduling
@@ -333,14 +337,33 @@ sequenceDiagram
 - Account summary fields split into:
   - fill-driven: `positionQty`, `avgEntryPriceKrw`, `realizedPnlKrw`, `fillCount`
   - mark-to-market: `markPriceKrw`, `marketValueKrw`, `equityKrw`, `unrealizedPnlKrw`, `totalPnlKrw`, `totalPnlPct`
+- fill-driven account summary values must use net execution values after applying the configured fee mode and slippage assumptions.
+- `apps/api/src/modules/runs/runs.service.ts` is also the SSOT for run KPI/trade artifact derivation:
+  - `trades` = completed round-trip trade count
+  - KPI return series = fee/slippage-adjusted closed-trade net returns
+  - `trades.csv` = actual matched `EXIT` + terminal `FILL` rows only
 
 ## N. Position Sizing SSOT
 - `apps/api/src/common/trading-risk.ts` is the SSOT for runtime risk snapshot resolution and entry sizing defaults.
 - `apps/api/src/modules/execution/engine/strategy-runtime-processor.ts` is responsible for converting strategy entry/exit intent into sized execution payloads.
 - BUY sizing sequence:
-  1. resolve account base KRW from latest strategy equity when available
-  2. fall back to `seedKrw` when no account history exists yet
-  3. compute target notional = `accountBaseKrw * maxPositionRatio`
-  4. compute qty = `floor(targetNotional / fillPrice, 8 decimals)`
+  1. STRAT_C는 `c.order.fixedKrw`가 유효하면 고정 주문금액을 우선 사용
+  2. 그 외 전략은 latest strategy equity를 account base KRW로 우선 사용
+  3. account history가 없으면 `seedKrw`로 fallback
+  4. risk-based path에서는 `targetNotional = accountBaseKrw * maxPositionRatio`
+  5. qty = `floor(targetNotional / fillPrice, 8 decimals)`
 - SELL sizing must reuse the open runtime position qty.
 - Strategy readiness scoring and signal generation stay qty-agnostic; sizing happens only inside the execution path after risk checks pass.
+
+### D7) Runtime session shell sync and deterministic operator E2E
+- Fixed run IDs may restore stale persisted runtime shells from older sessions.
+- Engine startup must re-sync the restored shell to the current env session for:
+  - `strategyVersion`
+  - `mode`
+  - `market`
+  - derived `entryPolicy`
+  - derived fill policy
+- The runtime updates in-memory state first and persists the shell re-sync best-effort.
+- `E2E_FORCE_SEMI_AUTO_SIGNAL=true` is reserved for STRAT_B operator-session verification.
+- The flag creates a deterministic `APPROVE_ENTER` path from the next `1m` candle open while preserving the standard approval contract.
+- `ENTRY_READINESS` must be deduplicated per strategy run when the candle time and readiness payload are unchanged, especially while `WAITING_APPROVAL`.

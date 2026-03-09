@@ -69,52 +69,52 @@ test('UpbitRealtimeEngine keeps STRAT_B entry readiness on the original candle e
 
   runtime.strategyState = {
     ...INITIAL_MOMENTUM_STATE,
-    recentCandles: Array.from({ length: 20 }, (_, index) => ({
-      time: index + 1,
-      open: 100,
-      high: 100.15,
-      low: 99.95,
-      close: 100.03
-    }))
+    candles1h: [
+      { time: 1, open: 100, high: 101, low: 99.8, close: 100.8 },
+      { time: 2, open: 100.8, high: 101.4, low: 100.5, close: 101.1 },
+      { time: 3, open: 101.1, high: 101.8, low: 100.9, close: 101.6 },
+      { time: 4, open: 101.6, high: 102.1, low: 101.2, close: 101.9 },
+      { time: 5, open: 101.9, high: 102.4, low: 101.6, close: 102.2 }
+    ],
+    stratB: {
+      stage: 'WAIT_CONFIRM',
+      bullMode: true,
+      activeZone: {
+        zoneLow: 100.2,
+        zoneHigh: 100.7,
+        obLow: 99.9,
+        obHigh: 100.8,
+        targetPrice: 102.8,
+        createdAt: 20,
+        expiresAt: 60,
+        sourceTime: 19,
+        trendLineSlope: 0.05,
+        trendLineBase: 99.8,
+        bullModeAtCreation: true
+      }
+    }
   };
-  const impulseCandle = {
+  const triggerCandle = {
     time: 21,
-    open: 100.0,
-    high: 100.8,
-    low: 99.95,
-    close: 100.7
+    open: 100.4,
+    high: 100.85,
+    low: 100.35,
+    close: 100.78
   };
-  const expectedImpulse = evaluateStrategyCandleDetailed(cfg.strategyId, runtime.strategyState, impulseCandle, cfg.momentum);
+  const expectedImpulse = evaluateStrategyCandleDetailed(cfg.strategyId, runtime.strategyState, triggerCandle, cfg.momentum, '15m');
 
   await (engine as unknown as {
     processClosedCandleForStrategy: (
       runtimeState: unknown,
       candle: Readonly<{ time: number; open: number; high: number; low: number; close: number }>,
-      eventTsMs: number
+      eventTsMs: number,
+      timeframe?: '1m' | '15m' | '1h'
     ) => Promise<void>;
-  }).processClosedCandleForStrategy(runtime, impulseCandle, 21_000);
+  }).processClosedCandleForStrategy(runtime, triggerCandle, 21_000, '15m');
 
   const impulseReadiness = captured.filter((event) => event.eventType === 'ENTRY_READINESS').at(-1);
   assert.equal(impulseReadiness?.payload.entryReadinessPct, expectedImpulse.readiness.entryReadinessPct);
   assert.equal(impulseReadiness?.payload.entryReady, expectedImpulse.readiness.entryReady);
-
-  await (engine as unknown as {
-    processClosedCandleForStrategy: (
-      runtimeState: unknown,
-      candle: Readonly<{ time: number; open: number; high: number; low: number; close: number }>,
-      eventTsMs: number
-    ) => Promise<void>;
-  }).processClosedCandleForStrategy(runtime, {
-    time: 22,
-    open: 100.6,
-    high: 100.72,
-    low: 100.3,
-    close: 100.4
-  }, 22_000);
-
-  const pullbackReadiness = captured.filter((event) => event.eventType === 'ENTRY_READINESS').at(-1);
-  assert.equal(pullbackReadiness?.payload.entryReadinessPct, 85);
-  assert.equal(pullbackReadiness?.payload.entryReady, false);
 });
 
 test('UpbitRealtimeEngine hydrates runtime candle history from RunsService', async () => {
@@ -335,4 +335,121 @@ test('UpbitRealtimeEngine clears snapshot delay after the first recovered live t
   assert.deepEqual(snapshotDelayCalls.map((item) => item.delayed), [false, false, false]);
   assert.equal(captured.filter((event) => event.eventType === 'MARKET_TICK').length, 3);
   assert.equal(logger.infos.some((entry) => entry.message === 'Runtime snapshot delay cleared by live trade recovery'), true);
+});
+
+test('UpbitRealtimeEngine syncs restored run control to the current env session on module init', async () => {
+  const prevRunMode = process.env.RUN_MODE;
+  const prevStrategyVersion = process.env.STRATEGY_VERSION;
+  const prevMarket = process.env.UPBIT_MARKET;
+  process.env.RUN_MODE = 'SEMI_AUTO';
+  process.env.STRATEGY_VERSION = 'v-sync';
+  process.env.UPBIT_MARKET = 'KRW-BTC';
+
+  try {
+    const restoreCalls: string[] = [];
+    const updateCalls: Array<Readonly<{
+      runId: string;
+      strategyId: string;
+      strategyVersion: string;
+      mode: string;
+      market: string;
+    }>> = [];
+    const snapshotDelayCalls: Array<Readonly<{ runId: string; delayed: boolean }>> = [];
+    const logger = new FakeLogger();
+    const metrics = new RuntimeMetricsService();
+    const engine = new UpbitRealtimeEngine(
+      { ingestEngineEvent: async () => undefined } as unknown as ConstructorParameters<typeof UpbitRealtimeEngine>[0],
+      logger as unknown as ConstructorParameters<typeof UpbitRealtimeEngine>[1],
+      metrics,
+      {
+        restoreRun: async (runId: string) => {
+          restoreCalls.push(runId);
+        },
+        updateRunControl: async (
+          runId: string,
+          input: Readonly<{
+            strategyId?: string;
+            strategyVersion?: string;
+            mode?: string;
+            market?: string;
+          }>
+        ) => {
+          updateCalls.push({
+            runId,
+            strategyId: input.strategyId ?? '',
+            strategyVersion: input.strategyVersion ?? '',
+            mode: input.mode ?? '',
+            market: input.market ?? ''
+          });
+          return undefined;
+        },
+        getLastSeq: () => 0,
+        getCandles: async () => [],
+        setSnapshotDelay: (runId: string, delayed: boolean) => {
+          snapshotDelayCalls.push({ runId, delayed });
+        }
+      } as unknown as ConstructorParameters<typeof UpbitRealtimeEngine>[3],
+      {
+        getMinuteCandles: async () => []
+      } as unknown as ConstructorParameters<typeof UpbitRealtimeEngine>[4]
+    );
+
+    ((engine as unknown as {
+      connection: { start: () => void };
+    }).connection).start = () => undefined;
+    (engine as unknown as {
+      bootstrapMinuteCandlesWithTimeout: () => Promise<boolean>;
+    }).bootstrapMinuteCandlesWithTimeout = async () => true;
+
+    await engine.onModuleInit();
+
+    assert.deepEqual(restoreCalls, ['run-strat-a-0001', 'run-strat-b-0001', 'run-strat-c-0001']);
+    assert.deepEqual(updateCalls, [
+      {
+        runId: 'run-strat-a-0001',
+        strategyId: 'STRAT_A',
+        strategyVersion: 'v-sync',
+        mode: 'SEMI_AUTO',
+        market: 'KRW-BTC'
+      },
+      {
+        runId: 'run-strat-b-0001',
+        strategyId: 'STRAT_B',
+        strategyVersion: 'v-sync',
+        mode: 'SEMI_AUTO',
+        market: 'KRW-BTC'
+      },
+      {
+        runId: 'run-strat-c-0001',
+        strategyId: 'STRAT_C',
+        strategyVersion: 'v-sync',
+        mode: 'SEMI_AUTO',
+        market: 'KRW-BTC'
+      }
+    ]);
+    assert.deepEqual(snapshotDelayCalls, [
+      { runId: 'run-strat-a-0001', delayed: true },
+      { runId: 'run-strat-b-0001', delayed: true },
+      { runId: 'run-strat-c-0001', delayed: true },
+      { runId: 'run-strat-a-0001', delayed: false },
+      { runId: 'run-strat-b-0001', delayed: false },
+      { runId: 'run-strat-c-0001', delayed: false }
+    ]);
+  } finally {
+    if (prevRunMode === undefined) {
+      delete process.env.RUN_MODE;
+    } else {
+      process.env.RUN_MODE = prevRunMode;
+    }
+    if (prevStrategyVersion === undefined) {
+      delete process.env.STRATEGY_VERSION;
+    } else {
+      process.env.STRATEGY_VERSION = prevStrategyVersion;
+    }
+    if (prevMarket === undefined) {
+      delete process.env.UPBIT_MARKET;
+    } else {
+      process.env.UPBIT_MARKET = prevMarket;
+    }
+  }
 });

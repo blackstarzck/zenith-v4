@@ -36,6 +36,14 @@ packages/contracts/src/
 원칙:
 - DTO 타입과 runtime schema를 같은 경로에서 관리한다.
 - API/WS 경계 타입은 `apps/api`, `apps/web` 모두 `packages/contracts`에서 import한다.
+- `packages/contracts/src/run/run-config.dto.ts` exports the run control SSOT:
+  - `StrategyId`, `RunMode`
+  - `FillModelRequested`, `FillModelApplied`
+  - `DatasetRefDto`, `RiskSnapshotDto`, `RunConfigDto`
+- `packages/contracts/src/run/run-report.dto.ts` exports the run read-model SSOT:
+  - `RunKpiDto`, `EntryReadinessDto`
+  - `RunHistoryItemDto`, `RunDetailDto`, `RunReportDto`
+  - `StrategyAccountSummaryDto`, `StrategyFillPageDto`
 
 ---
 
@@ -181,17 +189,26 @@ export type WsEventEnvelopeDto<TPayload = Readonly<Record<string, unknown>>> = R
 ### 6.4 실시간 시세/전략 이벤트 payload 표준(현재 구현)
 - `MARKET_TICK`
   - `payload.market`: string (예: `KRW-XRP`)
+  - `payload.strategyId`: `STRAT_A | STRAT_B | STRAT_C`
+  - `payload.strategyVersion`: string
+  - `payload.strategyName`: string
   - `payload.tradePrice`: number
   - `payload.tradeVolume`: number
-  - `payload.candle`: `{ time, open, high, low, close }` (1분 OHLC)
-- 전략 이벤트(`SIGNAL_EMIT`, `ORDER_INTENT`, `FILL`, `POSITION_UPDATE`, `EXIT`)
+  - `payload.askBid`: string
+  - `payload.change`: string
+  - `payload.bestBidPrice?`: number
+  - `payload.bestAskPrice?`: number
+  - `payload.candle`: `{ time, open, high, low, close, volume?, tradeValue?, buyValue?, buyRatio?, bestBidPrice?, bestAskPrice? }`
+- 전략 이벤트(`SIGNAL_EMIT`, `APPROVE_ENTER`, `ENTRY_READINESS`, `ORDER_INTENT`, `FILL`, `POSITION_UPDATE`, `EXIT`)
   - `SEMI_AUTO`에서는 `APPROVE_ENTER` 이벤트가 진입 전 반드시 선행된다.
-  - 공통: `payload.market`, `payload.candle`, `payload.strategy`
+  - 공통: `payload.market`, `payload.candle`, `payload.strategyId`, `payload.strategyVersion`, `payload.strategyName`
   - 이벤트별 세부값:
-    - `SIGNAL_EMIT`: `signal`, `candleReturnPct`, `thresholdPct`
-    - `ORDER_INTENT`: `side`, `qty`, `price`, `reason`
-    - `FILL`: `side`, `qty`, `fillPrice`
-    - `POSITION_UPDATE`: `side`, `qty`, `avgEntry | realizedPnlPct`
+    - `SIGNAL_EMIT`: `signal`, `reason` + 전략별 세부 필드(`zoneLow`, `zoneHigh`, `targetPrice`, `breakoutLevel`, `tradeValue`, `buyRatio`, `bodyRatio` 등)
+    - `APPROVE_ENTER`: `approvalMode`, `entryPolicy`, `suggestedPrice`
+    - `ENTRY_READINESS`: `entryReadinessPct`, `entryReady`, `entryExecutable`, `reason`, `inPosition`
+    - `ORDER_INTENT`: `side`, `qty`, `price`, `reason`, `notionalKrw?`
+    - `FILL`: `side`, `qty`, `fillPrice`, `notionalKrw?`
+    - `POSITION_UPDATE`: `side`, `qty`, `avgEntry | realizedPnlPct`, `notionalKrw?`
     - `EXIT`: `reason`, `pnlPct`, `barsHeld`
 
 ---
@@ -216,18 +233,20 @@ export type WsEventEnvelopeDto<TPayload = Readonly<Record<string, unknown>>> = R
 - `GET /runs/:runId`
 - `GET /runs/:runId/config`
 - `GET /runs/:runId/candles?limit=300`
+- `GET /runs/:runId/run_report.json`
 - `GET /runs/:runId/events.jsonl`
 - `GET /runs/:runId/trades.csv`
 - `GET /runs/strategies/:strategyId/fills?page=&pageSize=`
 - `GET /runs/strategies/:strategyId/account-summary`
 - `GET /reports/compare?strategyVersion=&from=&to=&mode=&market=`
+- `GET /reports/benchmark-compare?strategyId=&strategyVersion=`
 - `PATCH /runs/:runId/control`
   - body:
     - `strategyId?: STRAT_A|STRAT_B|STRAT_C`
     - `mode?: PAPER|SEMI_AUTO|AUTO|LIVE`
     - `market?: string`
-    - `fillModelRequested?: AUTO|NEXT_OPEN|ON_CLOSE`
-    - `fillModelApplied?: NEXT_OPEN|ON_CLOSE`
+    - `fillModelRequested?: AUTO|NEXT_OPEN|ON_CLOSE|NEXT_MINUTE_OPEN|INTRABAR_APPROX`
+    - `fillModelApplied?: NEXT_OPEN|ON_CLOSE|NEXT_MINUTE_OPEN|INTRABAR_APPROX`
     - `entryPolicy?: string`
 - `GET /ops/metrics`
   - runtime counters:
@@ -245,6 +264,11 @@ export type WsEventEnvelopeDto<TPayload = Readonly<Record<string, unknown>>> = R
 - `winRate`, `sumReturnPct`, `mddPct`
 - `profitFactor`, `avgWinPct`, `avgLossPct`
 - `strategyVersion`
+
+`GET /runs/history` KPI contract note:
+- `trades`는 raw `FILL` 개수가 아니라 완료된 round-trip trade 개수다.
+- `winRate`, `sumReturnPct`, `profitFactor`, `avgWinPct`, `avgLossPct`, `mddPct`는 실제 매칭된 진입/청산 체결의 순손익 기준으로 계산한다.
+- `exits`는 참고용 raw `EXIT` 이벤트 개수이며, `trades`보다 클 수 있다.
 
 `GET /runs/:runId` 응답 추가 필드(현재):
 - `runConfig`
@@ -272,9 +296,11 @@ export type WsEventEnvelopeDto<TPayload = Readonly<Record<string, unknown>>> = R
 - `markPriceKrw` must resolve to the latest retained strategy market price/candle close when available, not only the last fill price
 - `marketValueKrw`, `equityKrw`, `unrealizedPnlKrw`, `totalPnlKrw`, and `totalPnlPct` are mark-to-market fields and may move on live market updates without a new `FILL`
 - `positionQty`, `avgEntryPriceKrw`, `realizedPnlKrw`, and `fillCount` remain fill-driven fields
+- `avgEntryPriceKrw` and `realizedPnlKrw` must use fee/slippage-adjusted net execution values, not raw fill price only
 
 `payload.candle` contract note:
 - `payload.candle.time` is the candle start bucket in Unix seconds.
+- `payload.candle` may include `tradeValue`, `buyValue`, `buyRatio`, `bestBidPrice`, `bestAskPrice` when the runtime derived them from live trade/orderbook flow.
 - For Upbit REST snapshot candles, `payload.candle.time` must be derived from `candle_date_time_utc`, not the REST `timestamp` field.
 
 ## 10) Realtime Status Contract Notes (ASCII appendix)
@@ -304,8 +330,44 @@ export type WsEventEnvelopeDto<TPayload = Readonly<Record<string, unknown>>> = R
 
 ## 13) Entry Sizing Contract Notes (ASCII appendix)
 - `runConfig.riskSnapshot` includes `seedKrw` and `maxPositionRatio` in addition to daily loss/order/kill-switch fields.
+- STRAT_C may size entry directly from `c.order.fixedKrw`; in that case `notionalKrw` follows the fixed-order result and does not use `maxPositionRatio`.
 - BUY execution payload contract:
   - `ORDER_INTENT.qty`, `FILL.qty`, and `POSITION_UPDATE.qty` must match for one accepted entry
 - SELL execution payload contract:
   - `ORDER_INTENT.qty` and `FILL.qty` must use the current open position qty, not a default literal
 - `notionalKrw` may be included on `ORDER_INTENT` and `FILL` payloads for display/debugging; clients must treat it as optional metadata.
+
+## 14) Trades CSV Contract Notes (ASCII appendix)
+- `GET /runs/:runId/trades.csv` must be derived from actual accepted `EXIT` + `FILL` events.
+- The artifact must not synthesize placeholder exit reasons or fake return percentages.
+- Each row represents one completed round-trip trade and `netReturnPct` must be net of configured fee/slippage assumptions.
+
+## 15) Run Report Artifact Contract Notes (ASCII appendix)
+- `GET /runs/:runId/run_report.json` returns the JSON artifact contract represented by `packages/contracts/src/run/run-report.dto.ts`.
+- `report.execution.*` must echo the same run control snapshot used by `GET /runs/:runId`.
+- `report.results.trades.*` and `report.results.pnl.*` must reuse the same fee/slippage-adjusted closed-trade derivation used by run history KPI.
+- `report.results.trades.profitFactor` is required so persisted run-report summaries can drive `/reports/compare` without recomputing full event history.
+- `report.artifacts.*` stores Storage-relative artifact paths rooted at `run-artifacts/<runId>/...`.
+- Generated artifacts are uploaded best-effort to Supabase Storage while `GET /runs/:runId/run_report.json`, `trades.csv`, and `events.jsonl` continue to serve the same content directly from the API.
+
+## 16) Shared Run-Control Rules Contract Notes (ASCII appendix)
+- `packages/contracts/src/run/run-control-rules.ts` is the SSOT for strategy-aware run-control constraints used by the web control panel and regression tests.
+- The module currently defines:
+  - allowed run modes per strategy
+  - allowed requested/applied fill models per strategy/mode
+  - derived `entryPolicy`
+  - strategy-specific control-note text
+  - strategy-specific overlay payload extraction for `zoneHigh`, `zoneLow`, `targetPrice`, and `breakoutLevel`
+
+## 17) Strategy-document Benchmark Compare Contract Notes (ASCII appendix)
+- `GET /reports/benchmark-compare` returns the contract represented by `packages/contracts/src/run/run-benchmark.dto.ts`.
+- The response must emit one row per requested strategy with:
+  - `status`: `MATCHED|DATASET_MISMATCH|EXECUTION_POLICY_MISMATCH|PARAMETER_MISMATCH|RULE_IMPLEMENTATION_GAP|BLOCKED|NO_CANDIDATE`
+  - `benchmark`: normalized document profile (dataset, execution, parameter, metric targets)
+  - `candidate`: the selected persisted run-report candidate, when available, including `candidate.datasetRef`
+  - `metricComparisons`: target vs actual deltas for the benchmark metrics
+  - `checks.datasetExact`: exact dataset identity gate
+  - `docClaimEligible`: true only when the candidate is `MATCHED` and `dataset_ref` proves exact equality
+- Metric comparison must prefer persisted `text_run_reports.kpi` over ad-hoc history recomputation.
+- `RunConfigDto.datasetRef`, `RunHistoryItemDto.datasetRef`, and `RunReportDto.dataset.datasetRef` are the SSOT fields for dataset identity.
+- Dataset/execution/fee verification may reconstruct the selected `run_report.json`, but the endpoint may still return `MATCHED` with `docClaimEligible=false` when dataset compatibility is known but exact replay identity is not.

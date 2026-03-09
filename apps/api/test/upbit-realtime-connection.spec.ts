@@ -154,7 +154,9 @@ test('UpbitRealtimeConnection subscribes to the trade stream on open and forward
   assert.equal(socket.sent.length, 1);
   assert.deepEqual(JSON.parse(socket.sent[0] ?? '[]'), [
     { ticket: 'zenith-multi-KRW-XRP' },
-    { type: 'trade', codes: ['KRW-XRP'], isOnlyRealtime: true }
+    { type: 'trade', codes: ['KRW-XRP'], isOnlyRealtime: true },
+    { type: 'ticker', codes: ['KRW-XRP'], isOnlyRealtime: true },
+    { type: 'orderbook', codes: ['KRW-XRP'], isOnlyRealtime: true }
   ]);
   assert.deepEqual(received, ['payload-1']);
   assert.equal(logger.infos.some((entry) => entry.message === 'Upbit websocket connected'), true);

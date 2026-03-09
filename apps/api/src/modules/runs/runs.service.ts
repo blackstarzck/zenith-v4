@@ -1,21 +1,34 @@
 import {
   CONNECTION_STATE,
+  type DatasetRefDto,
   type ConnectionState,
   type RealtimeStatusDto,
+  type RunReportDto,
   type WsEventEnvelopeDto
 } from '@zenith/contracts';
 import { Injectable } from '@nestjs/common';
 import { resolveRuntimeRiskSnapshot, resolveSeedCapitalKrw } from '../../common/trading-risk';
-import { SupabaseClientService, type PersistedRunRow } from '../../infra/db/supabase/client/supabase.client';
+import { DEFAULT_PARAMETER_VALUES } from '../execution/engine/parameter-registry';
+import { resolveStrategyConfig } from '../execution/engine/strategy-config';
+import {
+  SupabaseClientService,
+  type PersistedRunRow,
+  type PersistedRunReportSummary,
+  type PersistedTradeInsert
+} from '../../infra/db/supabase/client/supabase.client';
+
+type FillModelRequested = 'AUTO' | 'NEXT_OPEN' | 'ON_CLOSE' | 'NEXT_MINUTE_OPEN' | 'INTRABAR_APPROX';
+type FillModelApplied = Exclude<FillModelRequested, 'AUTO'>;
 
 type RunSnapshot = Readonly<{
   runId: string;
   strategyId: 'STRAT_A' | 'STRAT_B' | 'STRAT_C';
   strategyVersion: string;
   mode: 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
-  fillModelRequested: 'AUTO' | 'NEXT_OPEN' | 'ON_CLOSE';
-  fillModelApplied: 'NEXT_OPEN' | 'ON_CLOSE';
+  fillModelRequested: FillModelRequested;
+  fillModelApplied: FillModelApplied;
   entryPolicy: string;
+  datasetRef: DatasetRefDto;
   market: string;
   createdAt: string;
   eventCount: number;
@@ -32,6 +45,7 @@ type RunConfig = Readonly<{
   fillModelRequested: RunSnapshot['fillModelRequested'];
   fillModelApplied: RunSnapshot['fillModelApplied'];
   entryPolicy: string;
+  datasetRef: DatasetRefDto;
   riskSnapshot: Readonly<{
     seedKrw: number;
     maxPositionRatio: number;
@@ -41,6 +55,13 @@ type RunConfig = Readonly<{
     killSwitch: boolean;
   }>;
   updatedAt: string;
+}>;
+
+type FeeSnapshot = Readonly<{
+  feeMode: 'PER_SIDE' | 'ROUNDTRIP';
+  feePerSide: number;
+  feeRoundtrip: number;
+  slippageAssumedPct: number;
 }>;
 
 type RunKpi = Readonly<{
@@ -68,6 +89,7 @@ type SeedRunOptions = Readonly<{
   strategyVersion?: string;
   mode?: RunSnapshot['mode'];
   market?: string;
+  datasetRef?: DatasetRefDto;
 }>;
 
 type RunControlInput = Readonly<{
@@ -78,6 +100,7 @@ type RunControlInput = Readonly<{
   fillModelRequested?: RunSnapshot['fillModelRequested'];
   fillModelApplied?: RunSnapshot['fillModelApplied'];
   entryPolicy?: string;
+  datasetRef?: DatasetRefDto;
 }>;
 
 type RunHistoryFilters = Readonly<{
@@ -119,6 +142,21 @@ type StrategyAccountSummary = Readonly<{
   lastFillAt?: string;
 }>;
 
+type ClosedTrade = Readonly<{
+  entryTime: string;
+  exitTime: string;
+  exitReason: string;
+  seq: number;
+  qty: number;
+  entryPrice: number;
+  exitPrice: number;
+  notionalKrw: number;
+  grossReturnPct: number;
+  netReturnPct: number;
+  realizedPnlKrw: number;
+  barsDelay: number;
+}>;
+
 type RunRealtimeState = Readonly<{
   transportState: ConnectionState;
   transportRetryCount: number;
@@ -151,6 +189,76 @@ function isTradeFillEvent(event: WsEventEnvelopeDto): boolean {
   return typeof payload.side === 'string' && typeof payload.fillPrice === 'number' && Number.isFinite(payload.fillPrice);
 }
 
+function resolveDefaultExecutionPolicy(
+  strategyId: RunSnapshot['strategyId'],
+  mode: RunSnapshot['mode']
+): Readonly<{
+  fillModelRequested: FillModelRequested;
+  fillModelApplied: FillModelApplied;
+  entryPolicy: string;
+}> {
+  const { momentum } = resolveStrategyConfig(strategyId);
+
+  if (strategyId === 'STRAT_A') {
+    const fillModelApplied = momentum.stratA?.entryAfterConfirmFill ?? 'NEXT_OPEN';
+    return {
+      fillModelRequested: 'AUTO',
+      fillModelApplied,
+      entryPolicy: fillModelApplied === 'ON_CLOSE' ? 'A_CONFIRM_ON_CLOSE' : 'A_CONFIRM_NEXT_OPEN'
+    };
+  }
+
+  if (strategyId === 'STRAT_B') {
+    const fillModelApplied = mode === 'SEMI_AUTO'
+      ? (momentum.stratB?.fillWhenSemiAuto ?? 'NEXT_OPEN')
+      : (momentum.stratB?.fillWhenAuto ?? 'ON_CLOSE');
+    return {
+      fillModelRequested: 'AUTO',
+      fillModelApplied,
+      entryPolicy: mode === 'SEMI_AUTO'
+        ? 'B_SEMI_AUTO_NEXT_OPEN_AFTER_APPROVAL'
+        : (fillModelApplied === 'NEXT_OPEN' ? 'B_POI_TOUCH_CONFIRM_NEXT_OPEN' : 'B_POI_TOUCH_CONFIRM_ON_CLOSE')
+    };
+  }
+
+  return {
+    fillModelRequested: 'AUTO',
+    fillModelApplied: 'NEXT_MINUTE_OPEN',
+    entryPolicy: 'C_NEXT_MINUTE_OPEN'
+  };
+}
+
+function normalizeFillModelRequested(
+  value: string | undefined,
+  fallback: FillModelRequested
+): FillModelRequested {
+  switch (value) {
+    case 'AUTO':
+    case 'NEXT_OPEN':
+    case 'ON_CLOSE':
+    case 'NEXT_MINUTE_OPEN':
+    case 'INTRABAR_APPROX':
+      return value;
+    default:
+      return fallback;
+  }
+}
+
+function normalizeFillModelApplied(
+  value: string | undefined,
+  fallback: FillModelApplied
+): FillModelApplied {
+  switch (value) {
+    case 'NEXT_OPEN':
+    case 'ON_CLOSE':
+    case 'NEXT_MINUTE_OPEN':
+    case 'INTRABAR_APPROX':
+      return value;
+    default:
+      return fallback;
+  }
+}
+
 type EntryReadinessSnapshot = Readonly<{
   entryReadinessPct: number;
   entryReady: boolean;
@@ -180,32 +288,49 @@ export class RunsService {
       return;
     }
 
+    const strategyId = options?.strategyId ?? 'STRAT_B';
+    const strategyVersion = options?.strategyVersion ?? (process.env.STRATEGY_VERSION ?? 'v1');
+    const mode = options?.mode ?? 'PAPER';
+    const market = options?.market ?? 'KRW-XRP';
+    const defaults = resolveDefaultExecutionPolicy(strategyId, mode);
+    const createdAt = new Date().toISOString();
+    const datasetRef = normalizeDatasetRef(
+      options?.datasetRef,
+      buildDefaultDatasetRef({
+        strategyId,
+        market,
+        createdAt
+      })
+    );
+
     this.runs.set(runId, {
       runId,
-      strategyId: options?.strategyId ?? 'STRAT_B',
-      strategyVersion: options?.strategyVersion ?? (process.env.STRATEGY_VERSION ?? 'v1'),
-      mode: options?.mode ?? 'PAPER',
-      fillModelRequested: 'AUTO',
-      fillModelApplied: 'NEXT_OPEN',
-      entryPolicy: 'AUTO',
-      market: options?.market ?? 'KRW-XRP',
-      createdAt: new Date().toISOString(),
+      strategyId,
+      strategyVersion,
+      mode,
+      fillModelRequested: defaults.fillModelRequested,
+      fillModelApplied: defaults.fillModelApplied,
+      entryPolicy: defaults.entryPolicy,
+      datasetRef,
+      market,
+      createdAt,
       eventCount: 0,
       lastSeq: 0
     });
     this.runConfigs.set(runId, {
       runId,
-      strategyId: options?.strategyId ?? 'STRAT_B',
-      strategyVersion: options?.strategyVersion ?? (process.env.STRATEGY_VERSION ?? 'v1'),
-      mode: options?.mode ?? 'PAPER',
-      market: options?.market ?? 'KRW-XRP',
-      fillModelRequested: 'AUTO',
-      fillModelApplied: 'NEXT_OPEN',
-      entryPolicy: 'AUTO',
+      strategyId,
+      strategyVersion,
+      mode,
+      market,
+      fillModelRequested: defaults.fillModelRequested,
+      fillModelApplied: defaults.fillModelApplied,
+      entryPolicy: defaults.entryPolicy,
+      datasetRef,
       riskSnapshot: resolveRuntimeRiskSnapshot({
-        strategyId: options?.strategyId ?? 'STRAT_B'
+        strategyId
       }),
-      updatedAt: new Date().toISOString()
+      updatedAt: createdAt
     });
 
     this.events.set(runId, []);
@@ -290,16 +415,28 @@ export class RunsService {
         this.db.getLatestRunEventByType(runId, 'ENTRY_READINESS')
       ]);
       const lastEvent = events[events.length - 1];
-      const fillModelApplied = row.fillModelApplied === 'ON_CLOSE' ? 'ON_CLOSE' : 'NEXT_OPEN';
+      const defaults = resolveDefaultExecutionPolicy(row.strategyId, row.mode);
+      const fillModelRequested = normalizeFillModelRequested(row.fillModelRequested, defaults.fillModelRequested);
+      const fillModelApplied = normalizeFillModelApplied(row.fillModelApplied, defaults.fillModelApplied);
+      const entryPolicy = row.entryPolicy ?? defaults.entryPolicy;
+      const datasetRef = normalizeDatasetRef(
+        row.datasetRef,
+        buildDefaultDatasetRef({
+          strategyId: row.strategyId,
+          market: row.market,
+          createdAt: row.createdAt
+        })
+      );
 
       this.runs.set(runId, {
         runId: row.runId,
         strategyId: row.strategyId,
         strategyVersion: row.strategyVersion,
         mode: row.mode,
-        fillModelRequested: row.fillModelRequested === 'ON_CLOSE' ? 'ON_CLOSE' : row.fillModelRequested === 'NEXT_OPEN' ? 'NEXT_OPEN' : 'AUTO',
+        fillModelRequested,
         fillModelApplied,
-        entryPolicy: 'AUTO',
+        entryPolicy,
+        datasetRef,
         market: row.market,
         createdAt: row.createdAt,
         eventCount: events.length,
@@ -313,8 +450,10 @@ export class RunsService {
         strategyVersion: row.strategyVersion,
         mode: row.mode,
         market: row.market,
-        fillModelRequested: row.fillModelRequested === 'ON_CLOSE' ? 'ON_CLOSE' : row.fillModelRequested === 'NEXT_OPEN' ? 'NEXT_OPEN' : 'AUTO',
+        fillModelRequested,
         fillModelApplied,
+        entryPolicy,
+        datasetRef,
         updatedAt: row.updatedAt ?? row.createdAt
       }));
 
@@ -377,9 +516,13 @@ export class RunsService {
       })
       .map((run) => ({
         ...run,
-        ...this.computeKpi(this.events.get(run.runId) ?? [])
+        ...this.computeKpi(this.events.get(run.runId) ?? [], run.strategyId)
       }))
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async listPersistedRunReportSummaries(runIds: readonly string[]): Promise<readonly PersistedRunReportSummary[]> {
+    return this.db.listRunReportSummaries(runIds);
   }
 
   async getRun(runId: string): Promise<(RunSnapshot & {
@@ -412,7 +555,7 @@ export class RunsService {
       ...run,
       runConfig,
       events,
-      kpi: this.computeKpi(events),
+      kpi: this.computeKpi(events, run.strategyId),
       ...(latestEntryReadiness ? { latestEntryReadiness } : {}),
       ...(realtimeStatus ? { realtimeStatus } : {})
     };
@@ -499,6 +642,7 @@ export class RunsService {
   async getStrategyAccountSummary(strategyId: RunSnapshot['strategyId']): Promise<StrategyAccountSummary> {
     await this.hydrateRecentRuns(500);
     const seedCapitalKrw = resolveSeedCapitalKrw(strategyId);
+    const feeSnapshot = resolveFeeSnapshot(strategyId);
     const fills = [...(await this.listMergedStrategyFillEvents(strategyId))]
       .sort((a, b) => {
         const tsDiff = Date.parse(a.eventTs) - Date.parse(b.eventTs);
@@ -528,27 +672,28 @@ export class RunsService {
 
       markPriceKrw = fillPrice;
       lastFillAt = fill.eventTs;
+      const execution = resolveEffectiveExecution(side === 'SELL' ? 'SELL' : 'BUY', fillPrice, qty, feeSnapshot);
 
       if (side === 'BUY') {
         const nextQty = positionQty + qty;
         if (nextQty > 0) {
-          avgEntryPriceKrw = ((avgEntryPriceKrw * positionQty) + (fillPrice * qty)) / nextQty;
+          avgEntryPriceKrw = ((avgEntryPriceKrw * positionQty) + execution.netNotionalKrw) / nextQty;
         }
         positionQty = nextQty;
-        cashKrw -= fillPrice * qty;
+        cashKrw -= execution.netNotionalKrw;
         return;
       }
 
       if (side === 'SELL') {
         const matchedQty = Math.min(positionQty, qty);
         if (matchedQty > 0) {
-          realizedPnlKrw += (fillPrice - avgEntryPriceKrw) * matchedQty;
+          realizedPnlKrw += execution.netPricePerQty * matchedQty - (avgEntryPriceKrw * matchedQty);
         }
-        positionQty = Math.max(0, positionQty - qty);
+        positionQty = Math.max(0, positionQty - matchedQty);
         if (positionQty === 0) {
           avgEntryPriceKrw = 0;
         }
-        cashKrw += fillPrice * qty;
+        cashKrw += execution.netPricePerQty * matchedQty;
       }
     });
 
@@ -656,7 +801,7 @@ export class RunsService {
     if (!run) {
       return undefined;
     }
-    return run.events.map((event) => JSON.stringify(event)).join('\n');
+    return buildEventsJsonl(run.events);
   }
 
   async getTradesCsv(runId: string): Promise<string | undefined> {
@@ -664,21 +809,86 @@ export class RunsService {
     if (!run) {
       return undefined;
     }
+    return buildTradesCsv(run.events, run.strategyId);
+  }
 
-    const fills = run.events.filter(isTradeFillEvent);
-    const header = 'tradeId,entryTime,exitReason,netReturnPct,seq';
-    const rows = fills.map((fill, index) => {
-      const pct = ((index % 5) - 2) * 0.21;
-      return [
-        `T-${String(index + 1).padStart(4, '0')}`,
-        fill.eventTs,
-        index % 2 === 0 ? 'TP1' : 'SL',
-        `${pct.toFixed(2)}%`,
-        String(fill.seq)
-      ].join(',');
+  async getRunReport(runId: string): Promise<RunReportDto | undefined> {
+    const run = await this.getRun(runId);
+    if (!run) {
+      return undefined;
+    }
+
+    const closedTrades = buildClosedTrades(run.events, run.strategyId);
+    const feeSnapshot = resolveFeeSnapshot(run.strategyId);
+    const winCount = closedTrades.filter((trade) => trade.netReturnPct > 0).length;
+    const lossCount = closedTrades.filter((trade) => trade.netReturnPct < 0).length;
+    const runReportJsonPath = `run-artifacts/${run.runId}/run_report.json`;
+    const tradesCsvPath = `run-artifacts/${run.runId}/trades.csv`;
+    const eventsJsonlPath = `run-artifacts/${run.runId}/events.jsonl`;
+
+    const report: RunReportDto = {
+      runId: run.runId,
+      createdAt: run.createdAt,
+      strategy: {
+        strategyId: run.strategyId,
+        strategyVersion: run.strategyVersion
+      },
+      dataset: {
+        market: run.market,
+        timeframes: resolveStrategyTimeframes(run.strategyId),
+        datasetRef: run.datasetRef
+      },
+      execution: {
+        mode: run.mode,
+        entryPolicy: run.entryPolicy,
+        fillModelRequested: run.fillModelRequested,
+        fillModelApplied: run.fillModelApplied
+      },
+      fees: {
+        feeMode: feeSnapshot.feeMode,
+        perSide: feeSnapshot.feeMode === 'PER_SIDE' ? feeSnapshot.feePerSide : null,
+        roundtrip: feeSnapshot.feeMode === 'ROUNDTRIP' ? feeSnapshot.feeRoundtrip : null,
+        slippageAssumedPct: feeSnapshot.slippageAssumedPct
+      },
+      risk: run.runConfig.riskSnapshot,
+      results: {
+        trades: {
+          count: run.kpi.trades,
+          exits: run.kpi.exits,
+          winCount,
+          lossCount,
+          winRate: run.kpi.winRate,
+          profitFactor: run.kpi.profitFactor,
+          avgWinPct: run.kpi.avgWinPct,
+          avgLossPct: run.kpi.avgLossPct,
+          sumReturnPct: run.kpi.sumReturnPct
+        },
+        pnl: {
+          totalKrw: roundMoney(closedTrades.reduce((acc, trade) => acc + trade.realizedPnlKrw, 0)),
+          mddPct: run.kpi.mddPct
+        },
+        exitReasonBreakdown: buildExitReasonBreakdown(closedTrades)
+      },
+      artifacts: {
+        runReportJson: runReportJsonPath,
+        tradesCsv: tradesCsvPath,
+        eventsJsonl: eventsJsonlPath
+      }
+    };
+    const runReportJson = JSON.stringify(report, null, 2);
+    const tradesCsv = buildTradesCsv(run.events, run.strategyId);
+    const eventsJsonl = buildEventsJsonl(run.events);
+
+    await this.db.syncRunArtifacts({
+      runId,
+      trades: buildPersistedTrades(runId, closedTrades),
+      report,
+      runReportJson,
+      tradesCsv,
+      eventsJsonl
     });
 
-    return [header, ...rows].join('\n');
+    return report;
   }
 
   async getCandles(runId: string, limit: number): Promise<CandleDto[] | undefined> {
@@ -723,7 +933,8 @@ export class RunsService {
           strategyId: inferredStrategyId,
           ...(input.strategyVersion ? { strategyVersion: input.strategyVersion } : {}),
           ...(input.mode ? { mode: input.mode } : {}),
-          ...(input.market ? { market: input.market } : {})
+          ...(input.market ? { market: input.market } : {}),
+          ...(input.datasetRef ? { datasetRef: input.datasetRef } : {})
         });
       }
     }
@@ -736,15 +947,29 @@ export class RunsService {
     if (!prevConfig) {
       return undefined;
     }
+    const nextStrategyId = input.strategyId ?? prev.strategyId;
+    const nextMode = input.mode ?? prev.mode;
+    const nextMarket = input.market ?? prev.market;
+    const defaults = resolveDefaultExecutionPolicy(nextStrategyId, nextMode);
+    const policyChanged = nextStrategyId !== prev.strategyId || nextMode !== prev.mode;
+    const nextDatasetRef = normalizeDatasetRef(
+      input.datasetRef,
+      buildDefaultDatasetRef({
+        strategyId: nextStrategyId,
+        market: nextMarket,
+        createdAt: prev.createdAt
+      })
+    );
     const next: RunSnapshot = {
       ...prev,
-      strategyId: input.strategyId ?? prev.strategyId,
+      strategyId: nextStrategyId,
       strategyVersion: input.strategyVersion ?? prev.strategyVersion,
-      mode: input.mode ?? prev.mode,
-      market: input.market ?? prev.market,
-      fillModelRequested: input.fillModelRequested ?? prev.fillModelRequested,
-      fillModelApplied: input.fillModelApplied ?? prev.fillModelApplied,
-      entryPolicy: input.entryPolicy ?? prev.entryPolicy
+      mode: nextMode,
+      market: nextMarket,
+      fillModelRequested: input.fillModelRequested ?? (policyChanged ? defaults.fillModelRequested : prev.fillModelRequested),
+      fillModelApplied: input.fillModelApplied ?? (policyChanged ? defaults.fillModelApplied : prev.fillModelApplied),
+      entryPolicy: input.entryPolicy ?? (policyChanged ? defaults.entryPolicy : prev.entryPolicy),
+      datasetRef: nextDatasetRef
     };
     const nextConfig: RunConfig = {
       ...prevConfig,
@@ -755,6 +980,7 @@ export class RunsService {
       fillModelRequested: next.fillModelRequested,
       fillModelApplied: next.fillModelApplied,
       entryPolicy: next.entryPolicy,
+      datasetRef: next.datasetRef,
       updatedAt: new Date().toISOString()
     };
     this.runs.set(runId, next);
@@ -765,7 +991,9 @@ export class RunsService {
       mode: next.mode,
       market: next.market,
       fillModelRequested: next.fillModelRequested,
-      fillModelApplied: next.fillModelApplied
+      fillModelApplied: next.fillModelApplied,
+      entryPolicy: next.entryPolicy,
+      datasetRef: next.datasetRef
     });
     return next;
   }
@@ -832,6 +1060,8 @@ export class RunsService {
     market: string;
     fillModelRequested: RunSnapshot['fillModelRequested'];
     fillModelApplied: RunSnapshot['fillModelApplied'];
+    entryPolicy: string;
+    datasetRef: DatasetRefDto;
     updatedAt: string;
   }>): RunConfig {
     return {
@@ -842,7 +1072,8 @@ export class RunsService {
       market: input.market,
       fillModelRequested: input.fillModelRequested,
       fillModelApplied: input.fillModelApplied,
-      entryPolicy: 'AUTO',
+      entryPolicy: input.entryPolicy,
+      datasetRef: input.datasetRef,
       riskSnapshot: resolveRuntimeRiskSnapshot({
         strategyId: input.strategyId
       }),
@@ -850,15 +1081,13 @@ export class RunsService {
     };
   }
 
-  private computeKpi(events: readonly WsEventEnvelopeDto[]): RunKpi {
-    const fills = events.filter(isTradeFillEvent);
+  private computeKpi(
+    events: readonly WsEventEnvelopeDto[],
+    strategyId: RunSnapshot['strategyId']
+  ): RunKpi {
+    const closedTrades = buildClosedTrades(events, strategyId);
     const exits = events.filter((event) => event.eventType === 'EXIT');
-    const pnlSeries = exits
-      .map((event) => {
-        const payload = event.payload as Readonly<Record<string, unknown>>;
-        return typeof payload.pnlPct === 'number' ? payload.pnlPct : undefined;
-      })
-      .filter((value): value is number => typeof value === 'number');
+    const pnlSeries = closedTrades.map((trade) => trade.netReturnPct);
 
     const sumReturnPct = pnlSeries.reduce((acc, value) => acc + value, 0);
     const wins = pnlSeries.filter((value) => value > 0);
@@ -881,7 +1110,7 @@ export class RunsService {
     });
 
     return {
-      trades: fills.length,
+      trades: closedTrades.length,
       exits: exits.length,
       winRate: Number(winRate.toFixed(2)),
       sumReturnPct: Number(sumReturnPct.toFixed(4)),
@@ -1005,6 +1234,10 @@ function roundQty(value: number): number {
   return Number(value.toFixed(8));
 }
 
+function roundPrice(value: number): number {
+  return Number(value.toFixed(8));
+}
+
 function roundPct(value: number): number {
   return Number(value.toFixed(4));
 }
@@ -1089,6 +1322,313 @@ function compareEventsByRecency(a: WsEventEnvelopeDto, b: WsEventEnvelopeDto): n
     return tsDiff;
   }
   return b.seq - a.seq;
+}
+
+function buildTradesCsvRows(
+  events: readonly WsEventEnvelopeDto[],
+  strategyId: RunSnapshot['strategyId']
+): string[] {
+  return buildClosedTrades(events, strategyId).map((trade, index) => ([
+    `T-${String(index + 1).padStart(4, '0')}`,
+    trade.entryTime,
+    trade.exitReason,
+    `${trade.netReturnPct.toFixed(2)}%`,
+    String(trade.seq)
+  ].join(',')));
+}
+
+function buildTradesCsv(
+  events: readonly WsEventEnvelopeDto[],
+  strategyId: RunSnapshot['strategyId']
+): string {
+  const header = 'tradeId,entryTime,exitReason,netReturnPct,seq';
+  const rows = buildTradesCsvRows(events, strategyId);
+  return [header, ...rows].join('\n');
+}
+
+function buildEventsJsonl(events: readonly WsEventEnvelopeDto[]): string {
+  return events.map((event) => JSON.stringify(event)).join('\n');
+}
+
+function buildExitReasonBreakdown(
+  trades: readonly ClosedTrade[]
+): Readonly<Record<string, number>> {
+  return trades.reduce<Record<string, number>>((acc, trade) => {
+    acc[trade.exitReason] = (acc[trade.exitReason] ?? 0) + 1;
+    return acc;
+  }, {});
+}
+
+function buildPersistedTrades(
+  runId: string,
+  trades: readonly ClosedTrade[]
+): PersistedTradeInsert[] {
+  return trades.map((trade, index) => ({
+    trade_id: `${runId}:T-${String(index + 1).padStart(4, '0')}`,
+    run_id: runId,
+    entry_ts: trade.entryTime,
+    exit_ts: trade.exitTime,
+    entry_price: roundPrice(trade.entryPrice),
+    exit_price: roundPrice(trade.exitPrice),
+    qty: roundQty(trade.qty),
+    notional_krw: roundMoney(trade.notionalKrw),
+    exit_reason: trade.exitReason,
+    gross_return_pct: roundPct(trade.grossReturnPct),
+    net_return_pct: roundPct(trade.netReturnPct),
+    bars_delay: trade.barsDelay
+  }));
+}
+
+function buildClosedTrades(
+  events: readonly WsEventEnvelopeDto[],
+  strategyId: RunSnapshot['strategyId']
+): ClosedTrade[] {
+  const ordered = [...events].sort((a, b) => {
+    const tsDiff = Date.parse(a.eventTs) - Date.parse(b.eventTs);
+    if (Number.isFinite(tsDiff) && tsDiff !== 0) {
+      return tsDiff;
+    }
+    return a.seq - b.seq;
+  });
+  const feeSnapshot = resolveFeeSnapshot(strategyId);
+  const trades: ClosedTrade[] = [];
+  let positionQty = 0;
+  let avgEntryPricePerQty = 0;
+  let avgEntryCostPerQty = 0;
+  let entryTime: string | undefined;
+  let pendingExitReason = 'UNKNOWN';
+
+  ordered.forEach((event) => {
+    if (event.eventType === 'EXIT') {
+      const payload = event.payload as Readonly<Record<string, unknown>>;
+      pendingExitReason = typeof payload.reason === 'string' ? payload.reason : 'UNKNOWN';
+      return;
+    }
+
+    if (!isTradeFillEvent(event)) {
+      return;
+    }
+
+    const payload = event.payload as Readonly<Record<string, unknown>>;
+    const side = typeof payload.side === 'string' ? payload.side.toUpperCase() : '';
+    const fillPrice = typeof payload.fillPrice === 'number' ? payload.fillPrice : 0;
+    const qty = resolveFillQty(payload);
+    if (qty <= 0 || fillPrice <= 0) {
+      return;
+    }
+
+    const execution = resolveEffectiveExecution(side === 'SELL' ? 'SELL' : 'BUY', fillPrice, qty, feeSnapshot);
+    if (side === 'BUY') {
+      const nextQty = positionQty + qty;
+      avgEntryPricePerQty = nextQty > 0
+        ? (((avgEntryPricePerQty * positionQty) + (fillPrice * qty)) / nextQty)
+        : avgEntryPricePerQty;
+      avgEntryCostPerQty = nextQty > 0
+        ? (((avgEntryCostPerQty * positionQty) + execution.netNotionalKrw) / nextQty)
+        : avgEntryCostPerQty;
+      positionQty = nextQty;
+      entryTime = entryTime ?? event.eventTs;
+      return;
+    }
+
+    if (side !== 'SELL') {
+      return;
+    }
+
+    const matchedQty = Math.min(positionQty, qty);
+    if (matchedQty <= 0) {
+      return;
+    }
+
+    const matchedExitValueKrw = execution.netPricePerQty * matchedQty;
+    const matchedEntryNotionalKrw = avgEntryPricePerQty * matchedQty;
+    const matchedEntryCostKrw = avgEntryCostPerQty * matchedQty;
+    const grossReturnPct = matchedEntryNotionalKrw > 0
+      ? ((fillPrice - avgEntryPricePerQty) / avgEntryPricePerQty) * 100
+      : 0;
+    const realizedPnlKrw = matchedExitValueKrw - matchedEntryCostKrw;
+    const netReturnPct = matchedEntryCostKrw > 0 ? (realizedPnlKrw / matchedEntryCostKrw) * 100 : 0;
+    trades.push({
+      entryTime: entryTime ?? event.eventTs,
+      exitTime: event.eventTs,
+      exitReason: pendingExitReason,
+      seq: event.seq,
+      qty: matchedQty,
+      entryPrice: roundPrice(avgEntryPricePerQty),
+      exitPrice: roundPrice(fillPrice),
+      notionalKrw: roundMoney(matchedEntryNotionalKrw),
+      grossReturnPct: roundPct(grossReturnPct),
+      netReturnPct: roundPct(netReturnPct),
+      realizedPnlKrw: roundMoney(realizedPnlKrw),
+      barsDelay: 0
+    });
+
+    positionQty = Math.max(0, positionQty - matchedQty);
+    if (positionQty === 0) {
+      avgEntryPricePerQty = 0;
+      avgEntryCostPerQty = 0;
+      entryTime = undefined;
+    }
+    pendingExitReason = 'UNKNOWN';
+  });
+
+  return trades;
+}
+
+function resolveStrategyTimeframes(
+  strategyId: RunSnapshot['strategyId']
+): readonly string[] {
+  if (strategyId === 'STRAT_A') {
+    return ['15m'];
+  }
+  if (strategyId === 'STRAT_B') {
+    return ['15m', '1h'];
+  }
+  return ['1m'];
+}
+
+function resolveStrategyDatasetFeeds(
+  strategyId: RunSnapshot['strategyId']
+): readonly string[] {
+  if (strategyId === 'STRAT_A') {
+    return ['candle:15m'];
+  }
+  if (strategyId === 'STRAT_B') {
+    return ['candle:15m', 'candle:1h'];
+  }
+  return ['trade', 'ticker', 'orderbook', 'candle:1m'];
+}
+
+function buildDefaultDatasetRef(input: Readonly<{
+  strategyId: RunSnapshot['strategyId'];
+  market: string;
+  createdAt: string;
+}>): DatasetRefDto {
+  const fallbackDateRangeLabel = /^\d{4}-\d{2}/.test(input.createdAt)
+    ? input.createdAt.slice(0, 7)
+    : 'runtime';
+  const timeframes = resolveStrategyTimeframes(input.strategyId);
+  const feeds = resolveStrategyDatasetFeeds(input.strategyId);
+
+  return {
+    key: buildDatasetRefKey({
+      source: 'UPBIT',
+      profile: 'REALTIME_RUNTIME',
+      market: input.market,
+      timeframes,
+      feeds,
+      dateRangeLabel: fallbackDateRangeLabel,
+      exact: false
+    }),
+    source: 'UPBIT',
+    profile: 'REALTIME_RUNTIME',
+    market: input.market,
+    timeframes,
+    feeds,
+    dateRangeLabel: fallbackDateRangeLabel,
+    exact: false
+  };
+}
+
+function normalizeDatasetRef(
+  value: DatasetRefDto | undefined,
+  fallback: DatasetRefDto
+): DatasetRefDto {
+  if (!value) {
+    return fallback;
+  }
+
+  const timeframes = value.timeframes.length > 0 ? value.timeframes : fallback.timeframes;
+  const feeds = value.feeds.length > 0 ? value.feeds : fallback.feeds;
+  const source = value.source;
+  const profile = value.profile;
+  const market = value.market || fallback.market;
+  const dateRangeLabel = value.dateRangeLabel || fallback.dateRangeLabel;
+  const exact = value.exact;
+
+  return {
+    key: value.key || buildDatasetRefKey({
+      source,
+      profile,
+      market,
+      timeframes,
+      feeds,
+      dateRangeLabel,
+      exact,
+      ...(value.windowStart ? { windowStart: value.windowStart } : {}),
+      ...(value.windowEnd ? { windowEnd: value.windowEnd } : {})
+    }),
+    source,
+    profile,
+    market,
+    timeframes,
+    feeds,
+    dateRangeLabel,
+    ...(value.windowStart ? { windowStart: value.windowStart } : {}),
+    ...(value.windowEnd ? { windowEnd: value.windowEnd } : {}),
+    exact
+  };
+}
+
+function buildDatasetRefKey(input: Readonly<{
+  source: DatasetRefDto['source'];
+  profile: DatasetRefDto['profile'];
+  market: string;
+  timeframes: readonly string[];
+  feeds: readonly string[];
+  dateRangeLabel: string;
+  exact: boolean;
+  windowStart?: string;
+  windowEnd?: string;
+}>): string {
+  return [
+    input.source,
+    input.profile,
+    input.market,
+    input.timeframes.join('+'),
+    input.feeds.join('+'),
+    input.dateRangeLabel,
+    input.windowStart ?? '',
+    input.windowEnd ?? '',
+    input.exact ? 'exact' : 'approx'
+  ].join('|');
+}
+
+function resolveFeeSnapshot(strategyId: RunSnapshot['strategyId']): FeeSnapshot {
+  const { momentum } = resolveStrategyConfig(strategyId);
+  return {
+    feeMode: DEFAULT_PARAMETER_VALUES.common.feeMode === 'ROUNDTRIP' ? 'ROUNDTRIP' : 'PER_SIDE',
+    feePerSide: momentum.feePerSide ?? DEFAULT_PARAMETER_VALUES.common.feePerSide,
+    feeRoundtrip: DEFAULT_PARAMETER_VALUES.common.feeRoundtrip,
+    slippageAssumedPct: momentum.slippageRate ?? DEFAULT_PARAMETER_VALUES.common.slippageAssumedPct
+  };
+}
+
+function resolveEffectiveExecution(
+  side: 'BUY' | 'SELL',
+  fillPrice: number,
+  qty: number,
+  feeSnapshot: FeeSnapshot
+): Readonly<{
+  netNotionalKrw: number;
+  netPricePerQty: number;
+}> {
+  const grossNotionalKrw = fillPrice * qty;
+  const slippageRate = Math.max(0, feeSnapshot.slippageAssumedPct);
+  const slippedNotionalKrw = side === 'BUY'
+    ? grossNotionalKrw * (1 + slippageRate)
+    : grossNotionalKrw * (1 - slippageRate);
+  const legFeeRate = feeSnapshot.feeMode === 'ROUNDTRIP'
+    ? feeSnapshot.feeRoundtrip / 2
+    : feeSnapshot.feePerSide;
+  const feeKrw = slippedNotionalKrw * Math.max(0, legFeeRate);
+  const netNotionalKrw = side === 'BUY'
+    ? slippedNotionalKrw + feeKrw
+    : slippedNotionalKrw - feeKrw;
+  return {
+    netNotionalKrw,
+    netPricePerQty: qty > 0 ? netNotionalKrw / qty : 0
+  };
 }
 
 function defaultRunRealtimeState(

@@ -1,7 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  buildControlConstraintNote as buildControlConstraintNoteFromRule,
   CONNECTION_STATE,
+  deriveEntryPolicy as deriveEntryPolicyFromRule,
+  type EntryReadinessDto,
+  extractStrategyOverlayLevels,
+  type FillModelApplied,
+  type FillModelRequested,
+  getAllowedAppliedFillModels as getAllowedAppliedFillModelsFromRule,
+  getAllowedModes as getAllowedModesFromRule,
+  getAllowedRequestedFillModels as getAllowedRequestedFillModelsFromRule,
+  normalizeAllowedValue as normalizeAllowedValueFromRule,
   type RealtimeStatusDto,
+  type RunConfigDto,
+  type RunDetailDto,
+  type RunKpiDto,
+  type RunMode,
+  type StrategyAccountSummaryDto,
+  type StrategyFillPageDto,
+  type StrategyId,
   type WsEventEnvelopeDto
 } from '@zenith/contracts';
 import {
@@ -47,7 +64,7 @@ const STRATEGY_CHART_THEME = {
   STRAT_B: {
     title: 'B: OB+FVG',
     description: 'POI zone + EMA trend entry',
-    overlays: ['EMA 20', 'EMA 60', 'POI High', 'POI Low']
+    overlays: ['EMA 20', 'EMA 60', 'POI High', 'POI Low', 'Target']
   },
   STRAT_C: {
     title: 'C: Profit-Max Scalper',
@@ -64,76 +81,16 @@ const DEFAULT_RUN_ID_BY_STRATEGY = {
   STRAT_B: 'run-strat-b-0001',
   STRAT_C: 'run-strat-c-0001'
 } as const;
+const ALLOWED_MODES_BY_STRATEGY: Readonly<Record<StrategyId, readonly RunMode[]>> = {
+  STRAT_A: ['PAPER', 'AUTO', 'LIVE'],
+  STRAT_B: ['PAPER', 'SEMI_AUTO', 'AUTO', 'LIVE'],
+  STRAT_C: ['PAPER', 'AUTO', 'LIVE']
+};
 
-type RunMode = 'PAPER' | 'SEMI_AUTO' | 'AUTO' | 'LIVE';
-type StrategyId = (typeof STRATEGY_IDS)[number];
-
-type FillModelRequested = 'AUTO' | 'NEXT_OPEN' | 'ON_CLOSE';
-type FillModelApplied = 'NEXT_OPEN' | 'ON_CLOSE';
-
-type RunKpi = Readonly<{
-  trades: number;
-  exits: number;
-  winRate: number;
-  sumReturnPct: number;
-  mddPct: number;
-  profitFactor: number;
-  avgWinPct: number;
-  avgLossPct: number;
-}>;
-
-type RiskSnapshot = Readonly<{
-  seedKrw: number;
-  maxPositionRatio: number;
-  dailyLossLimitPct: number;
-  maxConsecutiveLosses: number;
-  maxDailyOrders: number;
-  killSwitch: boolean;
-}>;
-
-type RunConfig = Readonly<{
-  runId: string;
-  strategyId: StrategyId;
-  strategyVersion: string;
-  mode: RunMode;
-  market: string;
-  fillModelRequested: FillModelRequested;
-  fillModelApplied: FillModelApplied;
-  entryPolicy: string;
-  riskSnapshot: RiskSnapshot;
-  updatedAt: string;
-}>;
-
-type RunHistoryRow = Readonly<{
-  runId: string;
-  strategyId: StrategyId;
-  strategyVersion: string;
-  mode: RunMode;
-  fillModelRequested: FillModelRequested;
-  fillModelApplied: FillModelApplied;
-  entryPolicy: string;
-  market: string;
-  createdAt: string;
-  eventCount: number;
-  lastSeq: number;
-  lastEventAt?: string;
-}> & RunKpi;
-
-type RunDetail = Readonly<{
-  runId: string;
-  strategyId: StrategyId;
-  strategyVersion: string;
-  mode: RunMode;
-  market: string;
-  fillModelRequested: FillModelRequested;
-  fillModelApplied: FillModelApplied;
-  entryPolicy: string;
-  runConfig: RunConfig;
-  events: readonly WsEventEnvelopeDto[];
-  kpi: RunKpi;
-  latestEntryReadiness?: EntryReadinessSnapshot;
-  realtimeStatus?: RealtimeStatusDto;
-}>;
+type RunDetail = RunDetailDto;
+type RunConfig = RunConfigDto;
+type RunKpi = RunKpiDto;
+type EntryReadinessSnapshot = EntryReadinessDto;
 
 type TradeRow = Readonly<{
   key: string;
@@ -186,29 +143,8 @@ type StrategySection = Readonly<{
 type StrategySections = Readonly<Record<StrategyId, StrategySection>>;
 type StrategyFillEvents = Readonly<Record<StrategyId, readonly WsEventEnvelopeDto[]>>;
 type StrategyFillPagination = Readonly<Record<StrategyId, Readonly<{ page: number; pageSize: number; total: number }>>>;
-type StrategyFillPageResponse = Readonly<{
-  items: readonly WsEventEnvelopeDto[];
-  total: number;
-  page: number;
-  pageSize: number;
-}>;
-
-type StrategyAccountSummary = Readonly<{
-  strategyId: StrategyId;
-  seedCapitalKrw: number;
-  cashKrw: number;
-  positionQty: number;
-  avgEntryPriceKrw: number;
-  markPriceKrw: number;
-  marketValueKrw: number;
-  equityKrw: number;
-  realizedPnlKrw: number;
-  unrealizedPnlKrw: number;
-  totalPnlKrw: number;
-  totalPnlPct: number;
-  fillCount: number;
-  lastFillAt?: string;
-}>;
+type StrategyFillPageResponse = StrategyFillPageDto;
+type StrategyAccountSummary = StrategyAccountSummaryDto;
 
 type StrategyAccountSummaries = Readonly<Record<StrategyId, StrategyAccountSummary | undefined>>;
 type StrategyEntryReadinessById = Readonly<Record<StrategyId, EntryReadinessSnapshot | undefined>>;
@@ -230,6 +166,54 @@ const EMPTY_ENTRY_READINESS_SNAPSHOT: EntryReadinessSnapshot = {
   reason: 'ENTRY_WAIT',
   inPosition: false
 };
+
+function getAllowedModes(strategyId: StrategyId): readonly RunMode[] {
+  return getAllowedModesFromRule(strategyId);
+}
+
+function getAllowedRequestedFillModels(
+  strategyId: StrategyId,
+  mode: RunMode
+): readonly FillModelRequested[] {
+  return getAllowedRequestedFillModelsFromRule(strategyId, mode);
+}
+
+function getAllowedAppliedFillModels(
+  strategyId: StrategyId,
+  mode: RunMode
+): readonly FillModelApplied[] {
+  return getAllowedAppliedFillModelsFromRule(strategyId, mode);
+}
+
+function normalizeAllowedValue<T extends string>(
+  value: T,
+  allowedValues: readonly T[]
+): T {
+  return normalizeAllowedValueFromRule(value, allowedValues);
+}
+
+function deriveEntryPolicy(
+  strategyId: StrategyId,
+  mode: RunMode,
+  fillModelApplied: FillModelApplied
+): string {
+  return deriveEntryPolicyFromRule(strategyId, mode, fillModelApplied);
+}
+
+function buildControlConstraintNote(
+  strategyId: StrategyId,
+  mode: RunMode
+): string {
+  if (strategyId === 'STRAT_A') {
+    return 'STRAT_A는 NEXT_OPEN 또는 ON_CLOSE만 허용하며 SEMI_AUTO를 사용하지 않습니다.';
+  }
+  if (strategyId === 'STRAT_B') {
+    return mode === 'SEMI_AUTO'
+      ? 'STRAT_B SEMI_AUTO는 승인 후 NEXT_OPEN만 허용합니다.'
+      : 'STRAT_B AUTO/PAPER/LIVE는 ON_CLOSE 또는 NEXT_OPEN을 사용할 수 있습니다.';
+  }
+  return 'STRAT_C는 NEXT_MINUTE_OPEN 고정 전략이며 SEMI_AUTO를 사용하지 않습니다.';
+}
 
 function toRealtimeStatus(input?: RealtimeStatusDto): RealtimeStatus | undefined {
   if (!input) {
@@ -767,7 +751,35 @@ function rollingExtremeSeries(
   return points;
 }
 
-function buildStrategyOverlayLines(strategyId: StrategyId, candles: readonly ChartCandle[]): ChartOverlayLine[] {
+function buildHorizontalLevelSeries(
+  candles: readonly ChartCandle[],
+  value: number
+): readonly ChartLinePoint[] {
+  return candles.map((candle) => ({ time: candle.time, value }));
+}
+
+function findLatestNumericPayloadValue(
+  events: readonly WsEventEnvelopeDto[],
+  keys: readonly string[]
+): number | undefined {
+  const ordered = [...events].sort((a, b) => b.seq - a.seq);
+  for (const event of ordered) {
+    const payload = event.payload as Readonly<Record<string, unknown>>;
+    for (const key of keys) {
+      const value = payload[key];
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        return value;
+      }
+    }
+  }
+  return undefined;
+}
+
+function buildStrategyOverlayLines(
+  strategyId: StrategyId,
+  candles: readonly ChartCandle[],
+  events: readonly WsEventEnvelopeDto[]
+): ChartOverlayLine[] {
   if (candles.length === 0) {
     return [];
   }
@@ -782,35 +794,52 @@ function buildStrategyOverlayLines(strategyId: StrategyId, candles: readonly Cha
   }
 
   if (strategyId === 'STRAT_B') {
+    const overlayLevels = extractStrategyOverlayLevels(strategyId, events);
     return [
-      { id: 'B-EMA20', label: 'EMA 20', color: '#0ea5e9', data: emaSeries(candles, 20), lineWidth: 2 },
-      { id: 'B-EMA60', label: 'EMA 60', color: '#1d4ed8', data: emaSeries(candles, 60), lineWidth: 2 },
+      { id: 'B-EMA20', label: 'EMA 20', color: '#0ea5e9', data: emaSeries(candles, 20), lineWidth: 2 as const },
+      { id: 'B-EMA60', label: 'EMA 60', color: '#1d4ed8', data: emaSeries(candles, 60), lineWidth: 2 as const },
       {
         id: 'B-POI-HIGH',
         label: 'POI High',
         color: UI_COLOR.status.warning,
-        data: rollingExtremeSeries(candles, 12, 'high', false),
+        data: typeof overlayLevels.zoneHigh === 'number'
+          ? buildHorizontalLevelSeries(candles, overlayLevels.zoneHigh)
+          : rollingExtremeSeries(candles, 12, 'high', false),
         lineStyle: LineStyle.Dotted
       },
       {
         id: 'B-POI-LOW',
         label: 'POI Low',
         color: '#fb923c',
-        data: rollingExtremeSeries(candles, 12, 'low', false),
+        data: typeof overlayLevels.zoneLow === 'number'
+          ? buildHorizontalLevelSeries(candles, overlayLevels.zoneLow)
+          : rollingExtremeSeries(candles, 12, 'low', false),
         lineStyle: LineStyle.Dotted
+      },
+      {
+        id: 'B-TARGET',
+        label: 'Target',
+        color: UI_COLOR.status.success,
+        data: typeof overlayLevels.targetPrice === 'number'
+          ? buildHorizontalLevelSeries(candles, overlayLevels.targetPrice)
+          : [],
+        lineStyle: LineStyle.Dashed
       }
-    ];
+    ].filter((line) => line.data.length > 0);
   }
 
+  const overlayLevels = extractStrategyOverlayLevels(strategyId, events);
   return [
     {
       id: 'C-BREAKOUT-REF',
       label: 'Breakout Ref',
       color: '#8b5cf6',
-      data: rollingExtremeSeries(candles, 10, 'high', true),
+      data: typeof overlayLevels.breakoutLevel === 'number'
+        ? buildHorizontalLevelSeries(candles, overlayLevels.breakoutLevel)
+        : rollingExtremeSeries(candles, 10, 'high', true),
       lineStyle: LineStyle.LargeDashed
     },
-    { id: 'C-EMA14', label: 'EMA 14', color: '#ec4899', data: emaSeries(candles, 14), lineWidth: 2 }
+    { id: 'C-EMA14', label: 'EMA 14', color: '#ec4899', data: emaSeries(candles, 14), lineWidth: 2 as const }
   ];
 }
 
@@ -1066,14 +1095,6 @@ function resolveEntryReadinessMeta(
   return { label: '대기 구간', color: UI_COLOR.status.info };
 }
 
-type EntryReadinessSnapshot = Readonly<{
-  entryReadinessPct: number;
-  entryReady: boolean;
-  entryExecutable: boolean;
-  reason: string;
-  inPosition: boolean;
-}>;
-
 function getLatestEntryReadiness(events: readonly WsEventEnvelopeDto[]): EntryReadinessSnapshot | undefined {
   const readinessEvent = [...events]
     .filter((event) => event.eventType === 'ENTRY_READINESS')
@@ -1188,8 +1209,15 @@ export function RunsLivePage() {
   const lastFillNoticeSeqRef = useRef<Partial<Record<StrategyId, number>>>({});
 
   const controlledSection = sections[controlStrategyId];
+  const allowedModes = getAllowedModes(controlStrategyId);
+  const normalizedMode = normalizeAllowedValue(mode, allowedModes);
+  const allowedRequestedFillModels = getAllowedRequestedFillModels(controlStrategyId, normalizedMode);
+  const normalizedFillModelRequested = normalizeAllowedValue(fillModelRequested, allowedRequestedFillModels);
+  const allowedAppliedFillModels = getAllowedAppliedFillModels(controlStrategyId, normalizedMode);
+  const normalizedFillModelApplied = normalizeAllowedValue(fillModelApplied, allowedAppliedFillModels);
   const controlRunId = controlledSection.runId ?? LIVE_RUN_ID;
-  const entryPolicy = mode === 'SEMI_AUTO' ? 'NEXT_OPEN_AFTER_APPROVAL' : 'AUTO';
+  const entryPolicy = deriveEntryPolicy(controlStrategyId, normalizedMode, normalizedFillModelApplied);
+  const controlConstraintNote = buildControlConstraintNoteFromRule(controlStrategyId, normalizedMode);
 
   const hydrateControlFromSection = useCallback((next: StrategySection | undefined) => {
     if (!next) {
@@ -1212,6 +1240,25 @@ export function RunsLivePage() {
       setFillModelApplied(next.fillModelApplied);
     }
   }, []);
+
+  useEffect(() => {
+    if (mode !== normalizedMode) {
+      setMode(normalizedMode);
+    }
+    if (fillModelRequested !== normalizedFillModelRequested) {
+      setFillModelRequested(normalizedFillModelRequested);
+    }
+    if (fillModelApplied !== normalizedFillModelApplied) {
+      setFillModelApplied(normalizedFillModelApplied);
+    }
+  }, [
+    fillModelApplied,
+    fillModelRequested,
+    mode,
+    normalizedFillModelApplied,
+    normalizedFillModelRequested,
+    normalizedMode
+  ]);
 
   const fetchStrategyFillPage = useCallback(async (
     strategyId: StrategyId,
@@ -1252,72 +1299,64 @@ export function RunsLivePage() {
         setBaseCandles([]);
       }
 
-      const history = await httpGet<RunHistoryRow[]>('/runs/history');
+      const builtEntries = await Promise.all(
+        STRATEGY_IDS.map(async (strategyId) => {
+          const runId = DEFAULT_RUN_ID_BY_STRATEGY[strategyId];
 
-    const latestByStrategy = new Map<StrategyId, RunHistoryRow>();
-    history.forEach((row) => {
-      if (!latestByStrategy.has(row.strategyId)) {
-        latestByStrategy.set(row.strategyId, row);
-      }
-    });
+          try {
+            const [detail, candles] = await Promise.all([
+              httpGet<RunDetail>(`/runs/${runId}`),
+              httpGet<ChartCandle[]>(`/runs/${runId}/candles?limit=300`)
+            ]);
+            const detailRealtimeStatus = toRealtimeStatus(detail.realtimeStatus);
 
-    const builtEntries = await Promise.all(
-      STRATEGY_IDS.map(async (strategyId) => {
-        const latest = latestByStrategy.get(strategyId);
-        if (!latest) {
-          return [strategyId, createEmptySection(strategyId)] as const;
+            const section: StrategySection = {
+              strategyId,
+              runId: detail.runId,
+              strategyVersion: detail.strategyVersion,
+              mode: detail.mode,
+              market: detail.market,
+              fillModelRequested: detail.fillModelRequested,
+              fillModelApplied: detail.fillModelApplied,
+              entryPolicy: detail.entryPolicy,
+              runConfig: detail.runConfig,
+              kpi: detail.kpi,
+              ...(detail.latestEntryReadiness ? { latestEntryReadiness: detail.latestEntryReadiness } : {}),
+              ...(detailRealtimeStatus ? { realtimeStatus: detailRealtimeStatus } : {}),
+              events: detail.events,
+              candles,
+              gapCount: computeGapCount(detail.events)
+            };
+
+            return [strategyId, section] as const;
+          } catch {
+            return [strategyId, createEmptySection(strategyId)] as const;
+          }
+        })
+      );
+
+      const nextSections = builtEntries.reduce<Record<StrategyId, StrategySection>>((acc, [strategyId, section]) => {
+        acc[strategyId] = section;
+        const maxSeq = section.events.reduce((max, event) => Math.max(max, event.seq), 0);
+        const latestEvent = [...section.events].sort((a, b) => {
+          const tsDiff = Date.parse(b.eventTs) - Date.parse(a.eventTs);
+          if (Number.isFinite(tsDiff) && tsDiff !== 0) {
+            return tsDiff;
+          }
+          return b.seq - a.seq;
+        })[0];
+        if (maxSeq > 0) {
+          lastSeqRef.current[strategyId] = maxSeq;
         }
-
-        const [detail, candles] = await Promise.all([
-          httpGet<RunDetail>(`/runs/${latest.runId}`),
-          httpGet<ChartCandle[]>(`/runs/${latest.runId}/candles?limit=300`)
-        ]);
-        const detailRealtimeStatus = toRealtimeStatus(detail.realtimeStatus);
-
-        const section: StrategySection = {
-          strategyId,
-          runId: detail.runId,
-          strategyVersion: detail.strategyVersion,
-          mode: detail.mode,
-          market: detail.market,
-          fillModelRequested: detail.fillModelRequested,
-          fillModelApplied: detail.fillModelApplied,
-          entryPolicy: detail.entryPolicy,
-          runConfig: detail.runConfig,
-          kpi: detail.kpi,
-          ...(detail.latestEntryReadiness ? { latestEntryReadiness: detail.latestEntryReadiness } : {}),
-          ...(detailRealtimeStatus ? { realtimeStatus: detailRealtimeStatus } : {}),
-          events: detail.events,
-          candles,
-          gapCount: computeGapCount(detail.events)
-        };
-
-        return [strategyId, section] as const;
-      })
-    );
-
-    const nextSections = builtEntries.reduce<Record<StrategyId, StrategySection>>((acc, [strategyId, section]) => {
-      acc[strategyId] = section;
-      const maxSeq = section.events.reduce((max, event) => Math.max(max, event.seq), 0);
-      const latestEvent = [...section.events].sort((a, b) => {
-        const tsDiff = Date.parse(b.eventTs) - Date.parse(a.eventTs);
-        if (Number.isFinite(tsDiff) && tsDiff !== 0) {
-          return tsDiff;
+        if (latestEvent?.eventTs) {
+          lastEventTsRef.current[strategyId] = latestEvent.eventTs;
         }
-        return b.seq - a.seq;
-      })[0];
-      if (maxSeq > 0) {
-        lastSeqRef.current[strategyId] = maxSeq;
-      }
-      if (latestEvent?.eventTs) {
-        lastEventTsRef.current[strategyId] = latestEvent.eventTs;
-      }
-      return acc;
-    }, {
-      STRAT_A: createEmptySection('STRAT_A'),
-      STRAT_B: createEmptySection('STRAT_B'),
-      STRAT_C: createEmptySection('STRAT_C')
-    });
+        return acc;
+      }, {
+        STRAT_A: createEmptySection('STRAT_A'),
+        STRAT_B: createEmptySection('STRAT_B'),
+        STRAT_C: createEmptySection('STRAT_C')
+      });
       setEntryReadinessByStrategy((prev) => buildEntryReadinessByStrategy(nextSections, prev));
       let mergedSections = nextSections;
       setSections((prev) => {
@@ -1393,10 +1432,10 @@ export function RunsLivePage() {
       await httpPatch<RunDetail, Record<string, unknown>>(`/runs/${controlRunId}/control`, {
         strategyId: controlStrategyId,
         strategyVersion,
-        mode,
+        mode: normalizedMode,
         market,
-        fillModelRequested,
-        fillModelApplied,
+        fillModelRequested: normalizedFillModelRequested,
+        fillModelApplied: normalizedFillModelApplied,
         entryPolicy
       });
     } catch (error) {
@@ -1407,11 +1446,11 @@ export function RunsLivePage() {
     controlRunId,
     controlStrategyId,
     entryPolicy,
-    fillModelApplied,
-    fillModelRequested,
     markError,
     market,
-    mode,
+    normalizedFillModelApplied,
+    normalizedFillModelRequested,
+    normalizedMode,
     strategyVersion
   ]);
 
@@ -1798,7 +1837,7 @@ export function RunsLivePage() {
   const selectedFillPagination = fillPaginationByStrategy[controlStrategyId];
   const selectedDisplayCandles = baseCandles.length > 0 ? baseCandles : controlledSection.candles;
   const isUsingSharedCandles = baseCandles.length > 0;
-  const selectedChartOverlays = buildStrategyOverlayLines(controlStrategyId, selectedDisplayCandles);
+  const selectedChartOverlays = buildStrategyOverlayLines(controlStrategyId, selectedDisplayCandles, controlledSection.events);
   const selectedChartMarkers = toChartMarkers(controlledSection.events);
   const selectedChartTheme = STRATEGY_CHART_THEME[controlStrategyId];
   const selectedDisplayedStatus = resolveDisplayRealtimeStatus(controlledSection.realtimeStatus, status, true);
@@ -1908,17 +1947,21 @@ export function RunsLivePage() {
                   <Col xs={24} md={12} lg={24}>
                     <Text type="secondary">모드</Text>
                     <Select
-                      value={mode}
+                      value={normalizedMode}
                       onChange={(value) => {
                         setMode(value as RunMode);
                       }}
                       style={{ width: '100%' }}
-                      options={[
-                        { value: 'PAPER', label: 'PAPER (모의)' },
-                        { value: 'SEMI_AUTO', label: 'SEMI_AUTO (반자동)' },
-                        { value: 'AUTO', label: 'AUTO (자동)' },
-                        { value: 'LIVE', label: 'LIVE (실거래)' }
-                      ]}
+                      options={allowedModes.map((value) => ({
+                        value,
+                        label: value === 'PAPER'
+                          ? 'PAPER (모의)'
+                          : value === 'SEMI_AUTO'
+                            ? 'SEMI_AUTO (반자동)'
+                            : value === 'AUTO'
+                              ? 'AUTO (자동)'
+                              : 'LIVE (실거래)'
+                      }))}
                     />
                   </Col>
                   <Col xs={24} md={12} lg={24}>
@@ -1939,31 +1982,33 @@ export function RunsLivePage() {
                   <Col xs={24} md={12} lg={24}>
                     <Text type="secondary">요청 체결 모델</Text>
                     <Select
-                      value={fillModelRequested}
+                      value={normalizedFillModelRequested}
                       onChange={(value) => {
                         setFillModelRequested(value as FillModelRequested);
                       }}
                       style={{ width: '100%' }}
-                      options={[
-                        { value: 'AUTO', label: 'AUTO' },
-                        { value: 'NEXT_OPEN', label: 'NEXT_OPEN' },
-                        { value: 'ON_CLOSE', label: 'ON_CLOSE' }
-                      ]}
+                      options={allowedRequestedFillModels.map((value) => ({
+                        value,
+                        label: value
+                      }))}
                     />
                   </Col>
                   <Col xs={24} md={12} lg={24}>
                     <Text type="secondary">적용 체결 모델</Text>
                     <Select
-                      value={fillModelApplied}
+                      value={normalizedFillModelApplied}
                       onChange={(value) => {
                         setFillModelApplied(value as FillModelApplied);
                       }}
                       style={{ width: '100%' }}
-                      options={[
-                        { value: 'NEXT_OPEN', label: 'NEXT_OPEN' },
-                        { value: 'ON_CLOSE', label: 'ON_CLOSE' }
-                      ]}
+                      options={allowedAppliedFillModels.map((value) => ({
+                        value,
+                        label: value
+                      }))}
                     />
+                  </Col>
+                  <Col xs={24} md={24} lg={24}>
+                    <Text type="secondary">{controlConstraintNote}</Text>
                   </Col>
                   <Col xs={24} md={12} lg={24}>
                     <Text type="secondary">전략 버전</Text>

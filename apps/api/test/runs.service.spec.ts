@@ -10,7 +10,8 @@ function createRunsService(): RunsService {
     listRunEvents: async () => [],
     getLatestRunEventByType: async () => undefined,
     updateRunShell: async () => undefined,
-    listAllStrategyFillEvents: async () => []
+    listAllStrategyFillEvents: async () => [],
+    syncRunArtifacts: async () => undefined
   } as unknown as ConstructorParameters<typeof RunsService>[0]);
 }
 
@@ -61,32 +62,139 @@ test('RunsService returns run history and run detail', async () => {
 test('RunsService builds export artifacts', async () => {
   const svc = createRunsService();
 
-  const fills: WsEventEnvelopeDto[] = [
+  const events: WsEventEnvelopeDto[] = [
     {
       runId: 'run-2',
       seq: 1,
       traceId: 'trace-1',
       eventType: 'FILL',
       eventTs: new Date().toISOString(),
-      payload: { px: 100 }
+      payload: { side: 'BUY', fillPrice: 100, qty: 1 }
     },
     {
       runId: 'run-2',
       seq: 2,
       traceId: 'trace-2',
+      eventType: 'EXIT',
+      eventTs: new Date().toISOString(),
+      payload: { reason: 'TP1', pnlPct: 1.25 }
+    },
+    {
+      runId: 'run-2',
+      seq: 3,
+      traceId: 'trace-3',
       eventType: 'FILL',
       eventTs: new Date().toISOString(),
-      payload: { px: 101 }
+      payload: { side: 'SELL', fillPrice: 101.25, qty: 1 }
     }
   ];
 
-  fills.forEach((e) => svc.ingestEvent(e));
+  events.forEach((e) => svc.ingestEvent(e));
 
   const jsonl = await svc.getEventsJsonl('run-2');
   const csv = await svc.getTradesCsv('run-2');
+  const report = await svc.getRunReport('run-2');
 
   assert.ok(jsonl?.includes('"eventType":"FILL"'));
   assert.ok(csv?.startsWith('tradeId,entryTime,exitReason,netReturnPct,seq'));
+  assert.ok(csv?.includes('TP1'));
+  assert.equal(report?.execution.fillModelApplied, 'ON_CLOSE');
+  assert.equal(report?.results.trades.count, 1);
+  assert.equal(report?.results.exitReasonBreakdown.TP1, 1);
+  assert.equal(report?.artifacts.runReportJson, 'run-artifacts/run-2/run_report.json');
+});
+
+test('RunsService persists text_trades/text_run_reports when building run_report', async () => {
+  let persisted:
+    | Readonly<{
+      runId: string;
+      trades: readonly Record<string, unknown>[];
+      report: Record<string, unknown>;
+      runReportJson: string;
+      tradesCsv: string;
+      eventsJsonl: string;
+    }>
+    | undefined;
+
+  const svc = new RunsService({
+    listRuns: async () => [],
+    getRun: async () => undefined,
+    listRunEvents: async () => [],
+    getLatestRunEventByType: async () => undefined,
+    updateRunShell: async () => undefined,
+    listAllStrategyFillEvents: async () => [],
+    syncRunArtifacts: async (input: Readonly<{
+      runId: string;
+      trades: readonly Record<string, unknown>[];
+      report: Record<string, unknown>;
+      runReportJson: string;
+      tradesCsv: string;
+      eventsJsonl: string;
+    }>) => {
+      persisted = {
+        runId: input.runId,
+        trades: input.trades,
+        report: input.report,
+        runReportJson: input.runReportJson,
+        tradesCsv: input.tradesCsv,
+        eventsJsonl: input.eventsJsonl
+      };
+    }
+  } as unknown as ConstructorParameters<typeof RunsService>[0]);
+
+  const events: WsEventEnvelopeDto[] = [
+    {
+      runId: 'run-persist-artifacts',
+      seq: 1,
+      traceId: 'persist-1',
+      eventType: 'FILL',
+      eventTs: '2026-03-08T00:00:00.000Z',
+      payload: { side: 'BUY', fillPrice: 100, qty: 2 }
+    },
+    {
+      runId: 'run-persist-artifacts',
+      seq: 2,
+      traceId: 'persist-2',
+      eventType: 'EXIT',
+      eventTs: '2026-03-08T00:01:00.000Z',
+      payload: { reason: 'TP1', pnlPct: 2.5 }
+    },
+    {
+      runId: 'run-persist-artifacts',
+      seq: 3,
+      traceId: 'persist-3',
+      eventType: 'FILL',
+      eventTs: '2026-03-08T00:01:01.000Z',
+      payload: { side: 'SELL', fillPrice: 102.5, qty: 2 }
+    }
+  ];
+
+  events.forEach((event) => svc.ingestEvent(event));
+
+  const report = await svc.getRunReport('run-persist-artifacts');
+
+  assert.equal(report?.results.trades.count, 1);
+  assert.equal(persisted?.runId, 'run-persist-artifacts');
+  assert.equal(persisted?.trades.length, 1);
+  assert.deepEqual(persisted?.trades[0], {
+    trade_id: 'run-persist-artifacts:T-0001',
+    run_id: 'run-persist-artifacts',
+    entry_ts: '2026-03-08T00:00:00.000Z',
+    exit_ts: '2026-03-08T00:01:01.000Z',
+    entry_price: 100,
+    exit_price: 102.5,
+    qty: 2,
+    notional_krw: 200,
+    exit_reason: 'TP1',
+    gross_return_pct: 2.5,
+    net_return_pct: 2.3976,
+    bars_delay: 0
+  });
+  assert.equal(persisted?.report.runId, 'run-persist-artifacts');
+  assert.equal((persisted?.report.artifacts as { runReportJson?: string }).runReportJson, 'run-artifacts/run-persist-artifacts/run_report.json');
+  assert.ok(persisted?.runReportJson.includes('"runId": "run-persist-artifacts"'));
+  assert.ok(persisted?.tradesCsv.includes('tradeId,entryTime,exitReason,netReturnPct,seq'));
+  assert.ok(persisted?.eventsJsonl.includes('"eventType":"FILL"'));
 });
 
 test('RunsService returns candle snapshot from market tick events', async () => {
@@ -177,7 +285,7 @@ test('RunsService computes KPI from EXIT pnl events', async () => {
       traceId: 't1',
       eventType: 'FILL',
       eventTs: new Date().toISOString(),
-      payload: { side: 'BUY', fillPrice: 100 }
+      payload: { side: 'BUY', fillPrice: 100, qty: 1 }
     },
     {
       runId: 'run-kpi',
@@ -191,22 +299,54 @@ test('RunsService computes KPI from EXIT pnl events', async () => {
       runId: 'run-kpi',
       seq: 3,
       traceId: 't3',
+      eventType: 'FILL',
+      eventTs: new Date().toISOString(),
+      payload: { side: 'SELL', fillPrice: 102, qty: 1 }
+    },
+    {
+      runId: 'run-kpi',
+      seq: 4,
+      traceId: 't4',
+      eventType: 'FILL',
+      eventTs: new Date().toISOString(),
+      payload: { side: 'BUY', fillPrice: 100, qty: 1 }
+    },
+    {
+      runId: 'run-kpi',
+      seq: 5,
+      traceId: 't5',
       eventType: 'EXIT',
       eventTs: new Date().toISOString(),
       payload: { reason: 'SL', pnlPct: -0.7 }
+    },
+    {
+      runId: 'run-kpi',
+      seq: 6,
+      traceId: 't6',
+      eventType: 'FILL',
+      eventTs: new Date().toISOString(),
+      payload: { side: 'SELL', fillPrice: 99.4, qty: 1 }
+    },
+    {
+      runId: 'run-kpi',
+      seq: 7,
+      traceId: 't7',
+      eventType: 'EXIT',
+      eventTs: new Date().toISOString(),
+      payload: { reason: 'IGNORED_EXTRA_EXIT', pnlPct: -0.1 }
     }
   ];
   events.forEach((event) => svc.ingestEvent(event));
 
   const run = await svc.getRun('run-kpi');
-  assert.equal(run?.kpi.trades, 1);
-  assert.equal(run?.kpi.exits, 2);
+  assert.equal(run?.kpi.trades, 2);
+  assert.equal(run?.kpi.exits, 3);
   assert.equal(run?.kpi.winRate, 50);
-  assert.equal(run?.kpi.sumReturnPct, 0.5);
-  assert.equal(run?.kpi.mddPct, -0.7);
-  assert.equal(run?.kpi.profitFactor, 1.7143);
-  assert.equal(run?.kpi.avgWinPct, 1.2);
-  assert.equal(run?.kpi.avgLossPct, -0.7);
+  assert.equal(run?.kpi.sumReturnPct, 1.1987);
+  assert.equal(run?.kpi.mddPct, -0.6994);
+  assert.equal(run?.kpi.profitFactor, 2.7139);
+  assert.equal(run?.kpi.avgWinPct, 1.8981);
+  assert.equal(run?.kpi.avgLossPct, -0.6994);
 });
 
 test('RunsService ignores legacy fill events without side/fillPrice in trade counts', async () => {
@@ -228,7 +368,23 @@ test('RunsService ignores legacy fill events without side/fillPrice in trade cou
       traceId: 'real-fill',
       eventType: 'FILL',
       eventTs: new Date().toISOString(),
-      payload: { side: 'BUY', fillPrice: 100 }
+      payload: { side: 'BUY', fillPrice: 100, qty: 1 }
+    },
+    {
+      runId: 'run-legacy-fill',
+      seq: 3,
+      traceId: 'exit-fill',
+      eventType: 'EXIT',
+      eventTs: new Date().toISOString(),
+      payload: { reason: 'TP2', pnlPct: 2.5 }
+    },
+    {
+      runId: 'run-legacy-fill',
+      seq: 4,
+      traceId: 'flat-fill',
+      eventType: 'FILL',
+      eventTs: new Date().toISOString(),
+      payload: { side: 'SELL', fillPrice: 102.5, qty: 1 }
     }
   ];
 
@@ -242,6 +398,57 @@ test('RunsService ignores legacy fill events without side/fillPrice in trade cou
   assert.ok(!csv?.includes('T-0002'));
 });
 
+test('RunsService seeds strategy-specific execution policy defaults', () => {
+  const svc = createRunsService();
+
+  svc.seedRun('run-a-default', { strategyId: 'STRAT_A', mode: 'PAPER' });
+  svc.seedRun('run-b-paper-default', { strategyId: 'STRAT_B', mode: 'PAPER' });
+  svc.seedRun('run-b-semi-default', { strategyId: 'STRAT_B', mode: 'SEMI_AUTO' });
+  svc.seedRun('run-c-default', { strategyId: 'STRAT_C', mode: 'AUTO' });
+
+  const runA = svc.getRunConfig('run-a-default');
+  const runBPaper = svc.getRunConfig('run-b-paper-default');
+  const runBSemi = svc.getRunConfig('run-b-semi-default');
+  const runC = svc.getRunConfig('run-c-default');
+
+  assert.equal(runA?.fillModelApplied, 'NEXT_OPEN');
+  assert.equal(runA?.entryPolicy, 'A_CONFIRM_NEXT_OPEN');
+  assert.equal(runBPaper?.fillModelApplied, 'ON_CLOSE');
+  assert.equal(runBPaper?.entryPolicy, 'B_POI_TOUCH_CONFIRM_ON_CLOSE');
+  assert.equal(runBSemi?.fillModelApplied, 'NEXT_OPEN');
+  assert.equal(runBSemi?.entryPolicy, 'B_SEMI_AUTO_NEXT_OPEN_AFTER_APPROVAL');
+  assert.equal(runC?.fillModelApplied, 'NEXT_MINUTE_OPEN');
+  assert.equal(runC?.entryPolicy, 'C_NEXT_MINUTE_OPEN');
+});
+
+test('RunsService hydrates persisted entryPolicy from the run shell snapshot', async () => {
+  const svc = new RunsService({
+    listRuns: async () => [],
+    getRun: async () => ({
+      runId: 'run-persisted-policy',
+      strategyId: 'STRAT_B',
+      strategyVersion: 'v9',
+      mode: 'SEMI_AUTO',
+      market: 'KRW-BTC',
+      fillModelRequested: 'AUTO',
+      fillModelApplied: 'NEXT_OPEN',
+      entryPolicy: 'B_SEMI_AUTO_NEXT_OPEN_AFTER_APPROVAL',
+      createdAt: '2026-03-08T00:00:00.000Z',
+      updatedAt: '2026-03-08T00:10:00.000Z'
+    }),
+    listRunEvents: async () => [],
+    getLatestRunEventByType: async () => undefined,
+    updateRunShell: async () => undefined,
+    listAllStrategyFillEvents: async () => [],
+    syncRunArtifacts: async () => undefined
+  } as unknown as ConstructorParameters<typeof RunsService>[0]);
+
+  const run = await svc.getRun('run-persisted-policy');
+
+  assert.equal(run?.entryPolicy, 'B_SEMI_AUTO_NEXT_OPEN_AFTER_APPROVAL');
+  assert.equal(run?.runConfig.entryPolicy, 'B_SEMI_AUTO_NEXT_OPEN_AFTER_APPROVAL');
+});
+
 test('RunsService merges persisted fill ledger rows with runtime fills without duplicates', async () => {
   const persisted = [
     createFillEvent('run-strat-b-0001', 1, { side: 'BUY', fillPrice: 100, qty: 2 })
@@ -252,7 +459,8 @@ test('RunsService merges persisted fill ledger rows with runtime fills without d
     listRunEvents: async () => [],
     getLatestRunEventByType: async () => undefined,
     updateRunShell: async () => undefined,
-    listAllStrategyFillEvents: async () => persisted
+    listAllStrategyFillEvents: async () => persisted,
+    syncRunArtifacts: async () => undefined
   } as unknown as ConstructorParameters<typeof RunsService>[0]);
 
   svc.seedRun('run-strat-b-0001', {
@@ -280,20 +488,21 @@ test('RunsService account summary uses persisted fill ledger rows as the source 
     listAllStrategyFillEvents: async () => [
       createFillEvent('run-strat-a-0001', 1, { side: 'BUY', fillPrice: 100, qty: 2 }),
       createFillEvent('run-strat-a-0001', 2, { side: 'SELL', fillPrice: 110, qty: 1 })
-    ]
+    ],
+    syncRunArtifacts: async () => undefined
   } as unknown as ConstructorParameters<typeof RunsService>[0]);
 
   const summary = await svc.getStrategyAccountSummary('STRAT_A');
 
   assert.equal(summary.fillCount, 2);
   assert.equal(summary.positionQty, 1);
-  assert.equal(summary.cashKrw, 999910);
-  assert.equal(summary.avgEntryPriceKrw, 100);
+  assert.equal(summary.cashKrw, 999909.84);
+  assert.equal(summary.avgEntryPriceKrw, 100.05);
   assert.equal(summary.markPriceKrw, 110);
-  assert.equal(summary.realizedPnlKrw, 10);
+  assert.equal(summary.realizedPnlKrw, 9.89);
   assert.equal(summary.marketValueKrw, 110);
-  assert.equal(summary.equityKrw, 1000020);
-  assert.equal(summary.totalPnlKrw, 20);
+  assert.equal(summary.equityKrw, 1000019.84);
+  assert.equal(summary.totalPnlKrw, 19.84);
 });
 
 test('RunsService account summary marks open position to the latest strategy candle close', async () => {
@@ -306,7 +515,8 @@ test('RunsService account summary marks open position to the latest strategy can
     listAllStrategyFillEvents: async () => [
       createFillEvent('run-strat-a-0001', 1, { side: 'BUY', fillPrice: 100, qty: 2 }),
       createFillEvent('run-strat-a-0001', 2, { side: 'SELL', fillPrice: 110, qty: 1 })
-    ]
+    ],
+    syncRunArtifacts: async () => undefined
   } as unknown as ConstructorParameters<typeof RunsService>[0]);
 
   svc.seedRun('run-strat-a-0001', {
@@ -333,9 +543,9 @@ test('RunsService account summary marks open position to the latest strategy can
   assert.equal(summary.positionQty, 1);
   assert.equal(summary.markPriceKrw, 120);
   assert.equal(summary.marketValueKrw, 120);
-  assert.equal(summary.equityKrw, 1000030);
-  assert.equal(summary.unrealizedPnlKrw, 20);
-  assert.equal(summary.totalPnlKrw, 30);
+  assert.equal(summary.equityKrw, 1000029.84);
+  assert.equal(summary.unrealizedPnlKrw, 19.95);
+  assert.equal(summary.totalPnlKrw, 29.84);
 });
 
 test('RunsService updates run control fields', async () => {
