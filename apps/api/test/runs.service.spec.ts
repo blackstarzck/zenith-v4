@@ -449,6 +449,71 @@ test('RunsService hydrates persisted entryPolicy from the run shell snapshot', a
   assert.equal(run?.runConfig.entryPolicy, 'B_SEMI_AUTO_NEXT_OPEN_AFTER_APPROVAL');
 });
 
+test('RunsService restores latest entry readiness even after runtime ticks repopulate the in-memory run', async () => {
+  let latestEntryReadinessFetches = 0;
+
+  const svc = new RunsService({
+    listRuns: async () => [],
+    getRun: async () => ({
+      runId: 'run-strat-a-0001',
+      strategyId: 'STRAT_A',
+      strategyVersion: 'v1',
+      mode: 'PAPER',
+      market: 'KRW-BTC',
+      fillModelRequested: 'AUTO',
+      fillModelApplied: 'ON_CLOSE',
+      entryPolicy: 'A_ON_CLOSE',
+      createdAt: '2026-03-09T00:00:00.000Z',
+      updatedAt: '2026-03-09T00:05:00.000Z'
+    }),
+    listRunEvents: async () => [],
+    getLatestRunEventByType: async () => {
+      latestEntryReadinessFetches += 1;
+      return {
+        runId: 'run-strat-a-0001',
+        seq: 7,
+        traceId: 'persisted-entry-readiness',
+        eventType: 'ENTRY_READINESS',
+        eventTs: '2026-03-09T00:04:00.000Z',
+        payload: {
+          entryReadinessPct: 78,
+          entryReady: false,
+          entryExecutable: false,
+          reason: 'ENTRY_WAIT',
+          inPosition: false
+        }
+      };
+    },
+    updateRunShell: async () => undefined,
+    listAllStrategyFillEvents: async () => [],
+    syncRunArtifacts: async () => undefined
+  } as unknown as ConstructorParameters<typeof RunsService>[0]);
+
+  svc.seedRun('run-strat-a-0001', {
+    strategyId: 'STRAT_A',
+    strategyVersion: 'v1',
+    mode: 'PAPER',
+    market: 'KRW-BTC'
+  });
+  svc.ingestEvent({
+    runId: 'run-strat-a-0001',
+    seq: 1,
+    traceId: 'runtime-market-tick',
+    eventType: 'MARKET_TICK',
+    eventTs: '2026-03-09T00:05:00.000Z',
+    payload: {
+      strategyId: 'STRAT_A',
+      candle: { time: 1772985900, open: 100, high: 102, low: 99, close: 101 }
+    }
+  });
+
+  const run = await svc.getRun('run-strat-a-0001');
+
+  assert.equal(run?.latestEntryReadiness?.entryReadinessPct, 78);
+  assert.equal(run?.latestEntryReadiness?.reason, 'ENTRY_WAIT');
+  assert.equal(latestEntryReadinessFetches, 1);
+});
+
 test('RunsService merges persisted fill ledger rows with runtime fills without duplicates', async () => {
   const persisted = [
     createFillEvent('run-strat-b-0001', 1, { side: 'BUY', fillPrice: 100, qty: 2 })

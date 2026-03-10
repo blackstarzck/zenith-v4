@@ -260,6 +260,7 @@
   4. snapshot timeout recovery clears delayed status for every runtime only after the first valid live trade
   5. Runs Live initial hydration must read the fixed strategy runtime shells (`run-strat-a-0001`, `run-strat-b-0001`, `run-strat-c-0001`) instead of selecting the latest historical run per strategy, so stale entry-readiness snapshots cannot leak into the live operator table
   6. In `WAITING_APPROVAL`, identical `ENTRY_READINESS` snapshots for the same candle must be deduplicated so tick/orderbook bursts do not pin one strategy at a misleadingly noisy 100%
+  7. Backend run-detail hydration must restore the latest persisted `ENTRY_READINESS` snapshot even if live `MARKET_TICK` events already recreated the in-memory event buffer after restart
 
 ### 7.13 Strategy-document benchmark guard (ASCII addendum)
 - Benchmark validation must follow `docs/ops/36_STRATEGY_DOC_VALIDATION_WORKFLOW_2026-03-08.md`.

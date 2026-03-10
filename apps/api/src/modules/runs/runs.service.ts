@@ -401,6 +401,13 @@ export class RunsService {
     const hasEvents = (this.events.get(runId)?.length ?? 0) > 0;
     const hasRun = this.runs.has(runId) && this.runConfigs.has(runId);
     if (hasRun && hasEvents) {
+      if (!this.latestEntryReadiness.has(runId)) {
+        try {
+          await this.syncLatestEntryReadiness(runId, this.events.get(runId) ?? []);
+        } catch {
+          // Ignore restore failures and keep serving in-memory runtime state.
+        }
+      }
       return;
     }
 
@@ -460,14 +467,7 @@ export class RunsService {
       this.events.set(runId, [...events].slice(-EVENT_RETENTION));
       const retainedFills = events.filter(isTradeFillEvent);
       this.fillEvents.set(runId, retainedFills.slice(-FILL_EVENT_RETENTION));
-      const latestSnapshot = latestEntryReadinessEvent
-        ? toEntryReadinessSnapshot(latestEntryReadinessEvent.payload as Readonly<Record<string, unknown>>)
-        : getLatestEntryReadinessFromEvents(events);
-      if (latestSnapshot) {
-        this.latestEntryReadiness.set(runId, latestSnapshot);
-      } else {
-        this.latestEntryReadiness.delete(runId);
-      }
+      await this.syncLatestEntryReadiness(runId, events, latestEntryReadinessEvent);
       this.candles.set(runId, []);
       events.forEach((event) => {
         const candle = this.extractCandle(event.payload as Readonly<Record<string, unknown>>);
@@ -482,6 +482,31 @@ export class RunsService {
     } catch {
       // Ignore restore failures and keep serving in-memory runtime state.
     }
+  }
+
+  private async syncLatestEntryReadiness(
+    runId: string,
+    events: readonly WsEventEnvelopeDto[],
+    latestEntryReadinessEvent?: WsEventEnvelopeDto
+  ): Promise<void> {
+    const latestSnapshot = getLatestEntryReadinessFromEvents(events) ??
+      (latestEntryReadinessEvent
+        ? toEntryReadinessSnapshot(latestEntryReadinessEvent.payload as Readonly<Record<string, unknown>>)
+        : await this.fetchLatestEntryReadinessSnapshot(runId));
+
+    if (latestSnapshot) {
+      this.latestEntryReadiness.set(runId, latestSnapshot);
+    } else {
+      this.latestEntryReadiness.delete(runId);
+    }
+  }
+
+  private async fetchLatestEntryReadinessSnapshot(runId: string): Promise<EntryReadinessSnapshot | undefined> {
+    const latestEntryReadinessEvent = await this.db.getLatestRunEventByType(runId, 'ENTRY_READINESS');
+    if (!latestEntryReadinessEvent) {
+      return undefined;
+    }
+    return toEntryReadinessSnapshot(latestEntryReadinessEvent.payload as Readonly<Record<string, unknown>>);
   }
 
   getLastSeq(runId: string): number {

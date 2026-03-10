@@ -57,3 +57,7 @@
 - Runs Live must hydrate each strategy section from the fixed strategy runtime run IDs (`run-strat-a-0001`, `run-strat-b-0001`, `run-strat-c-0001`).
 - Using `/runs/history` to pick the latest historical run per strategy is invalid for the live operator table because it can surface stale `ENTRY_READINESS` from an older run.
 - `WAITING_APPROVAL` 상태에서는 동일 캔들/동일 payload의 `ENTRY_READINESS`를 반복 발행하지 않는다.
+
+## 2026-03-10 persisted readiness restore fix
+- Backend `getRun()` hydration must restore the latest persisted `ENTRY_READINESS` snapshot even when live `MARKET_TICK` events have already repopulated the in-memory run after restart.
+- Without this guard, the operator table can show all three strategies at `0%` until the next readiness emission even though persistence already has the latest valid snapshot.

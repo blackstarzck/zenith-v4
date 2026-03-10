@@ -367,3 +367,4 @@ sequenceDiagram
 - `E2E_FORCE_SEMI_AUTO_SIGNAL=true` is reserved for STRAT_B operator-session verification.
 - The flag creates a deterministic `APPROVE_ENTER` path from the next `1m` candle open while preserving the standard approval contract.
 - `ENTRY_READINESS` must be deduplicated per strategy run when the candle time and readiness payload are unchanged, especially while `WAITING_APPROVAL`.
+- `RunsService.getRun()` must backfill the latest persisted `ENTRY_READINESS` snapshot even when `MARKET_TICK` events have already repopulated the in-memory run after restart, so the operator table does not stay pinned at `0%` until the next readiness emission.
